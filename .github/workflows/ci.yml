@@ -4,18 +4,26 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   rust:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-24.04]
+        os: [windows-latest, ubuntu-22.04, ubuntu-24.04]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      - uses: actions/checkout@v6
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.94.1 --profile minimal --component rustfmt --component clippy
+      - name: Toolchain diagnostics
+        run: rustc -Vv && cargo -V
       - name: Install Linux desktop dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-xcb-dev libgl1-mesa-dev xvfb
@@ -25,4 +33,9 @@ jobs:
       - run: cargo build --workspace --release
       - name: Linux window startup smoke test
         if: runner.os == 'Linux'
-        run: timeout 15s xvfb-run -a cargo run --release -p matcha-app || test $? -eq 124
+        shell: bash
+        run: |
+          set +e
+          timeout 15s xvfb-run -a cargo run --release -p matcha-app
+          status=$?
+          test "$status" -eq 124 -o "$status" -eq 143

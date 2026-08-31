@@ -95,12 +95,25 @@ pub struct TerminalCursor {
     pub row: usize,
     pub column: usize,
     pub shape: CursorShape,
+    pub blinking: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CellPoint {
     pub row: usize,
     pub column: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BufferPoint {
+    pub line: i32,
+    pub column: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BufferRange {
+    pub start: BufferPoint,
+    pub end: BufferPoint,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -130,11 +143,19 @@ impl CellRange {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DamageRegion {
+    pub row: usize,
+    pub left: usize,
+    pub right: usize,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub enum FrameDamage {
     #[default]
     Full,
-    Partial,
+    Partial(Vec<DamageRegion>),
+    None,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -216,12 +237,23 @@ pub struct SearchRequest {
 pub struct SearchResult {
     pub matches: Vec<CellRange>,
     pub active: Option<usize>,
+    pub current: Option<usize>,
+    pub total: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SearchDirection {
+    Next,
+    Previous,
 }
 
 pub trait TerminalModel: Send + Sync {
     fn feed(&self, bytes: &[u8]);
     fn resize(&self, size: TerminalSize);
     fn frame(&self) -> TerminalFrame;
+    fn full_frame(&self) -> TerminalFrame {
+        self.frame()
+    }
     fn size(&self) -> TerminalSize;
     fn drain_actions(&self) -> Vec<TerminalAction>;
     fn scroll(&self, lines: i32);
@@ -229,6 +261,8 @@ pub trait TerminalModel: Send + Sync {
     fn set_selection(&self, selection: Option<CellRange>);
     fn selection_text(&self) -> Option<String>;
     fn search(&self, request: &SearchRequest) -> SearchResult;
+    fn navigate_search(&self, direction: SearchDirection) -> SearchResult;
+    fn prepare_session_restart(&self, profile_name: &str);
 
     fn drain_host_responses(&self) -> Vec<Vec<u8>> {
         self.drain_actions()
@@ -242,7 +276,7 @@ pub trait TerminalModel: Send + Sync {
 
     #[must_use]
     fn visible_text(&self) -> String {
-        let frame = self.frame();
+        let frame = self.full_frame();
         let mut output = String::new();
         for row in 0..frame.size.lines {
             let mut line = String::new();

@@ -4,7 +4,7 @@ use std::io::{Read, Write};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
-use crossbeam_channel::{Receiver, Sender, bounded};
+use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use matcha_core::ShellProfile;
 use matcha_terminal::{TerminalModel, TerminalSize};
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
@@ -28,6 +28,8 @@ pub enum PtyError {
     },
     #[error("terminal input channel is closed")]
     InputClosed,
+    #[error("terminal input queue is full")]
+    InputBackpressure,
     #[error("failed to resize PTY: {0}")]
     Resize(#[source] anyhow::Error),
     #[error("failed to terminate shell: {0}")]
@@ -49,9 +51,9 @@ pub struct LocalPtySession {
     child_killer: Box<dyn ChildKiller + Send + Sync>,
     input: Sender<Vec<u8>>,
     events: Receiver<SessionEvent>,
-    _child_thread: JoinHandle<()>,
-    _reader_thread: JoinHandle<()>,
-    _writer_thread: JoinHandle<()>,
+    child_thread: Option<JoinHandle<()>>,
+    reader_thread: Option<JoinHandle<()>>,
+    writer_thread: Option<JoinHandle<()>>,
 }
 
 impl LocalPtySession {
@@ -146,9 +148,9 @@ impl LocalPtySession {
             child_killer,
             input: input_tx,
             events: event_rx,
-            _child_thread: child_thread,
-            _reader_thread: reader_thread,
-            _writer_thread: writer_thread,
+            child_thread: Some(child_thread),
+            reader_thread: Some(reader_thread),
+            writer_thread: Some(writer_thread),
         })
     }
 
@@ -159,8 +161,11 @@ impl LocalPtySession {
     /// Returns [`PtyError::InputClosed`] after the writer worker has stopped.
     pub fn write(&self, bytes: impl Into<Vec<u8>>) -> Result<(), PtyError> {
         self.input
-            .send(bytes.into())
-            .map_err(|_| PtyError::InputClosed)
+            .try_send(bytes.into())
+            .map_err(|error| match error {
+                TrySendError::Full(_) => PtyError::InputBackpressure,
+                TrySendError::Disconnected(_) => PtyError::InputClosed,
+            })
     }
 
     #[must_use]
@@ -192,6 +197,20 @@ impl LocalPtySession {
 impl Drop for LocalPtySession {
     fn drop(&mut self) {
         let _ = self.child_killer.kill();
+        let handles = [
+            self.child_thread.take(),
+            self.reader_thread.take(),
+            self.writer_thread.take(),
+        ];
+        // Joining ConPTY workers can block while Windows drains its final output.
+        // Reap them outside the UI thread after this session's channels are dropped.
+        let _ = thread::Builder::new()
+            .name("matcha-pty-reaper".into())
+            .spawn(move || {
+                for handle in handles.into_iter().flatten() {
+                    let _ = handle.join();
+                }
+            });
     }
 }
 

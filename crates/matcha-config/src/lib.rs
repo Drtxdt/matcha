@@ -1,5 +1,6 @@
 //! Persistent Matcha application settings and shell profile discovery.
 
+use std::collections::HashSet;
 use std::env;
 use std::ffi::OsString;
 use std::fs;
@@ -11,6 +12,7 @@ use atomicwrites::{AllowOverwrite, AtomicFile};
 use directories::{BaseDirs, ProjectDirs};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use uuid::Uuid;
 
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_SCROLLBACK_LINES: usize = 50_000;
@@ -139,6 +141,16 @@ impl AppConfig {
         self.schema_version = CURRENT_SCHEMA_VERSION;
         self.terminal.font_size = self.terminal.font_size.clamp(8.0, 48.0);
         self.terminal.scrollback_lines = self.terminal.scrollback_lines.min(MAX_SCROLLBACK_LINES);
+        if self.shell_profiles.is_empty() {
+            self.shell_profiles = discover_shell_profiles();
+        }
+        let mut ids = HashSet::new();
+        for profile in &mut self.shell_profiles {
+            if profile.id.trim().is_empty() || !ids.insert(profile.id.clone()) {
+                profile.id = new_profile_id();
+                ids.insert(profile.id.clone());
+            }
+        }
         if !self
             .shell_profiles
             .iter()
@@ -158,6 +170,58 @@ impl AppConfig {
             .find(|profile| profile.id == self.default_shell_profile)
             .or_else(|| self.shell_profiles.first())
     }
+}
+
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum ProfileValidationError {
+    #[error("profile name is required")]
+    EmptyName,
+    #[error("profile program is required")]
+    EmptyProgram,
+    #[error("profile program does not exist or cannot be found in PATH")]
+    ProgramNotFound,
+    #[error("profile startup directory does not exist")]
+    StartupDirectoryNotFound,
+}
+
+#[must_use]
+pub fn new_profile_id() -> String {
+    Uuid::new_v4().to_string()
+}
+
+/// Validates a shell profile against the supplied executable search path.
+///
+/// # Errors
+///
+/// Returns the first invalid required field or filesystem location.
+pub fn validate_shell_profile(
+    profile: &ShellProfileConfig,
+    path: Option<&OsString>,
+) -> Result<(), ProfileValidationError> {
+    if profile.name.trim().is_empty() {
+        return Err(ProfileValidationError::EmptyName);
+    }
+    if profile.program.as_os_str().is_empty() {
+        return Err(ProfileValidationError::EmptyProgram);
+    }
+    let program_found = profile.program.is_file()
+        || (profile.program.components().count() == 1
+            && profile
+                .program
+                .to_str()
+                .and_then(|program| find_in_path(program, path))
+                .is_some());
+    if !program_found {
+        return Err(ProfileValidationError::ProgramNotFound);
+    }
+    if profile
+        .startup_directory
+        .as_ref()
+        .is_some_and(|directory| !directory.is_dir())
+    {
+        return Err(ProfileValidationError::StartupDirectoryNotFound);
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -254,18 +318,22 @@ pub fn save(path: &Path, config: &AppConfig) -> Result<(), ConfigError> {
 #[must_use]
 pub fn discover_shell_profiles() -> Vec<ShellProfileConfig> {
     let home = BaseDirs::new().map(|dirs| dirs.home_dir().to_owned());
+    let login_shell = env::var_os("SHELL");
     discover_shell_profiles_with(
         env::var_os("PATH").as_ref(),
-        env::var_os("SHELL"),
+        login_shell.as_ref(),
         home.as_ref(),
     )
 }
 
 fn discover_shell_profiles_with(
     path: Option<&OsString>,
-    _login_shell: Option<OsString>,
+    login_shell: Option<&OsString>,
     home: Option<&PathBuf>,
 ) -> Vec<ShellProfileConfig> {
+    #[cfg(windows)]
+    let _ = &login_shell;
+
     #[cfg(windows)]
     let candidates = [
         ("powershell-7", "PowerShell 7", "pwsh.exe", vec!["-NoLogo"]),
@@ -294,7 +362,7 @@ fn discover_shell_profiles_with(
 
     #[cfg(not(windows))]
     {
-        let program = _login_shell
+        let program = login_shell
             .map(PathBuf::from)
             .filter(|shell| shell.is_file())
             .or_else(|| find_in_path("bash", path))
@@ -362,6 +430,24 @@ mod tests {
         assert!(clipboard.confirm_multiline_paste);
         assert!(!clipboard.allow_osc52_read);
         assert!(clipboard.trusted_osc52_write_profiles.is_empty());
+    }
+
+    #[test]
+    fn validates_profile_required_fields_and_locations() {
+        let executable = env::current_exe().expect("test executable path is available");
+        let mut profile = ShellProfileConfig {
+            id: new_profile_id(),
+            name: "Test shell".into(),
+            program: executable,
+            args: Vec::new(),
+            startup_directory: Some(env::temp_dir()),
+        };
+        assert_eq!(validate_shell_profile(&profile, None), Ok(()));
+        profile.name.clear();
+        assert_eq!(
+            validate_shell_profile(&profile, None),
+            Err(ProfileValidationError::EmptyName)
+        );
     }
 
     #[test]

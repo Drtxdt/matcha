@@ -4,17 +4,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Dimensions, Scroll};
+use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::color::Colors;
-use alacritty_terminal::term::{ClipboardType, Config, Term, TermMode};
+use alacritty_terminal::term::{ClipboardType, Config, Term, TermDamage, TermMode};
 use alacritty_terminal::vte::ansi;
 use alacritty_terminal::vte::ansi::{Color, CursorShape as AlacrittyCursorShape, NamedColor, Rgb};
 use parking_lot::Mutex;
+use regex::RegexBuilder;
 
 use crate::{
-    CellPoint, CellRange, CellStyle, ClipboardKind, CursorShape, FrameDamage, RenderCell,
-    SearchRequest, SearchResult, TerminalAction, TerminalColor, TerminalCursor, TerminalFrame,
-    TerminalModel, TerminalModes, TerminalSize, UnderlineStyle,
+    BufferPoint, BufferRange, CellPoint, CellRange, CellStyle, ClipboardKind, CursorShape,
+    DamageRegion, FrameDamage, RenderCell, SearchDirection, SearchRequest, SearchResult,
+    TerminalAction, TerminalColor, TerminalCursor, TerminalFrame, TerminalModel, TerminalModes,
+    TerminalSize, UnderlineStyle,
 };
 
 #[derive(Clone, Debug)]
@@ -70,7 +73,14 @@ pub struct AlacrittyTerminal {
     term: Arc<Mutex<Term<ModelEventListener>>>,
     actions: Arc<Mutex<VecDeque<TerminalAction>>>,
     selection: Arc<Mutex<Option<CellRange>>>,
+    search: Mutex<SearchState>,
     revision: AtomicU64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SearchState {
+    matches: Vec<BufferRange>,
+    current: Option<usize>,
 }
 
 impl AlacrittyTerminal {
@@ -94,8 +104,16 @@ impl AlacrittyTerminal {
             term: Arc::new(Mutex::new(term)),
             actions,
             selection: Arc::new(Mutex::new(None)),
+            search: Mutex::new(SearchState::default()),
             revision: AtomicU64::new(0),
         }
+    }
+
+    /// Number of history rows currently retained outside the visible screen.
+    #[must_use]
+    pub fn scrollback_len(&self) -> usize {
+        let term = self.term.lock();
+        term.total_lines().saturating_sub(term.screen_lines())
     }
 }
 
@@ -113,44 +131,40 @@ impl TerminalModel for AlacrittyTerminal {
 
     fn frame(&self) -> TerminalFrame {
         let mut term = self.term.lock();
-        let size = TerminalSize::new(term.columns(), term.screen_lines());
-        let content = term.renderable_content();
-        let display_offset = content.display_offset;
-        let modes = terminal_modes(content.mode);
-        let display_offset_i32 = i32::try_from(display_offset).unwrap_or(i32::MAX);
-        let cursor_line = content
-            .cursor
-            .point
-            .line
-            .0
-            .saturating_add(display_offset_i32);
-        let cursor = TerminalCursor {
-            row: usize::try_from(cursor_line).unwrap_or(0),
-            column: content.cursor.point.column.0,
-            shape: cursor_shape(content.cursor.shape),
+        let damage = match term.damage() {
+            TermDamage::Full => FrameDamage::Full,
+            TermDamage::Partial(lines) => {
+                let regions = lines
+                    .map(|line| DamageRegion {
+                        row: line.line,
+                        left: line.left,
+                        right: line.right,
+                    })
+                    .collect::<Vec<_>>();
+                if regions.is_empty() {
+                    FrameDamage::None
+                } else {
+                    FrameDamage::Partial(regions)
+                }
+            }
         };
-        let colors = *content.colors;
-        let cells = content
-            .display_iter
-            .filter_map(|indexed| {
-                let row = usize::try_from(indexed.point.line.0.saturating_add(display_offset_i32))
-                    .ok()?;
-                (row < size.lines)
-                    .then(|| render_cell(row, indexed.point.column.0, indexed.cell, &colors))
-            })
-            .collect();
+        let frame = extract_frame(
+            &term,
+            self.revision.load(Ordering::Acquire),
+            damage,
+            *self.selection.lock(),
+        );
         term.reset_damage();
+        frame
+    }
 
-        TerminalFrame {
-            revision: self.revision.load(Ordering::Acquire),
-            size,
-            damage: FrameDamage::Full,
-            cells,
-            cursor,
-            selection: *self.selection.lock(),
-            display_offset,
-            modes,
-        }
+    fn full_frame(&self) -> TerminalFrame {
+        extract_frame(
+            &self.term.lock(),
+            self.revision.load(Ordering::Acquire),
+            FrameDamage::Full,
+            *self.selection.lock(),
+        )
     }
 
     fn size(&self) -> TerminalSize {
@@ -196,7 +210,7 @@ impl TerminalModel for AlacrittyTerminal {
 
     fn selection_text(&self) -> Option<String> {
         let range = self.selection.lock().as_ref().copied()?.normalized();
-        let frame = self.frame();
+        let frame = self.full_frame();
         let mut output = String::new();
         for row in range.start.row..=range.end.row.min(frame.size.lines.saturating_sub(1)) {
             let start = if row == range.start.row {
@@ -229,43 +243,207 @@ impl TerminalModel for AlacrittyTerminal {
 
     fn search(&self, request: &SearchRequest) -> SearchResult {
         if request.query.is_empty() {
+            *self.search.lock() = SearchState::default();
             return SearchResult::default();
         }
-        let frame = self.frame();
-        let needle = if request.case_sensitive {
-            request.query.clone()
-        } else {
-            request.query.to_lowercase()
-        };
-        let needle_length = request.query.chars().count().max(1);
-        let mut matches = Vec::new();
-        for row in 0..frame.size.lines {
-            let line: String = frame
-                .cells
-                .iter()
-                .filter(|cell| cell.row == row && !cell.style.wide_spacer)
-                .flat_map(|cell| cell.text.chars())
-                .collect();
-            let haystack = if request.case_sensitive {
-                line
-            } else {
-                line.to_lowercase()
-            };
-            for (byte_index, _) in haystack.match_indices(&needle) {
-                let column = haystack[..byte_index].chars().count();
-                matches.push(CellRange {
-                    start: CellPoint { row, column },
-                    end: CellPoint {
-                        row,
-                        column: column + needle_length - 1,
-                    },
-                });
+        let term = self.term.lock();
+        let matches = collect_search_matches(&term, request);
+        let current = matches.len().checked_sub(1);
+        let state = SearchState { matches, current };
+        let result = visible_search_result(&term, &state);
+        *self.search.lock() = state;
+        result
+    }
+
+    fn navigate_search(&self, direction: SearchDirection) -> SearchResult {
+        let mut term = self.term.lock();
+        let mut state = self.search.lock();
+        if state.matches.is_empty() {
+            return SearchResult::default();
+        }
+        let current = state.current.unwrap_or(0);
+        state.current = Some(match direction {
+            SearchDirection::Next => (current + 1) % state.matches.len(),
+            SearchDirection::Previous => current.checked_sub(1).unwrap_or(state.matches.len() - 1),
+        });
+        let active = state.matches[state.current.unwrap_or(0)];
+        scroll_match_into_view(&mut term, active);
+        self.revision.fetch_add(1, Ordering::Release);
+        visible_search_result(&term, &state)
+    }
+
+    fn prepare_session_restart(&self, profile_name: &str) {
+        let profile_name: String = profile_name
+            .chars()
+            .filter(|character| !character.is_control())
+            .collect();
+        let marker = format!(
+            "\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?2004l\x1b[0m\r\n\r\n--- Matcha · {profile_name} ---\r\n"
+        );
+        self.set_selection(None);
+        self.feed(marker.as_bytes());
+        *self.search.lock() = SearchState::default();
+    }
+}
+
+fn collect_search_matches(
+    term: &Term<ModelEventListener>,
+    request: &SearchRequest,
+) -> Vec<BufferRange> {
+    let Ok(regex) = RegexBuilder::new(&regex::escape(&request.query))
+        .case_insensitive(!request.case_sensitive)
+        .build()
+    else {
+        return Vec::new();
+    };
+    let history = term.total_lines().saturating_sub(term.screen_lines());
+    let history = i32::try_from(history).unwrap_or(i32::MAX);
+    let screen_lines = i32::try_from(term.screen_lines()).unwrap_or(i32::MAX);
+    let mut matches = Vec::new();
+
+    for line in -history..screen_lines {
+        let row = &term.grid()[Line(line)];
+        let mut text = String::new();
+        let mut positions = Vec::new();
+        for column in 0..term.columns() {
+            let cell = &row[Column(column)];
+            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                continue;
+            }
+            positions.push((text.len(), column));
+            text.push(cell.c);
+            if let Some(zerowidth) = cell.zerowidth() {
+                for character in zerowidth {
+                    positions.push((text.len(), column));
+                    text.push(*character);
+                }
             }
         }
-        SearchResult {
-            active: (!matches.is_empty()).then_some(0),
-            matches,
+        for found in regex.find_iter(&text) {
+            let start = positions
+                .iter()
+                .rev()
+                .find(|(byte, _)| *byte <= found.start())
+                .map_or(0, |(_, column)| *column);
+            let end = positions
+                .iter()
+                .rev()
+                .find(|(byte, _)| *byte < found.end())
+                .map_or(start, |(_, column)| *column);
+            matches.push(BufferRange {
+                start: BufferPoint {
+                    line,
+                    column: start,
+                },
+                end: BufferPoint { line, column: end },
+            });
         }
+    }
+    matches
+}
+
+fn visible_search_result(term: &Term<ModelEventListener>, state: &SearchState) -> SearchResult {
+    let offset = i32::try_from(term.grid().display_offset()).unwrap_or(i32::MAX);
+    let screen_lines = i32::try_from(term.screen_lines()).unwrap_or(i32::MAX);
+    let mut visible = Vec::new();
+    let mut active = None;
+    for (index, found) in state.matches.iter().enumerate() {
+        let row = found.start.line.saturating_add(offset);
+        if !(0..screen_lines).contains(&row) {
+            continue;
+        }
+        if state.current == Some(index) {
+            active = Some(visible.len());
+        }
+        visible.push(CellRange {
+            start: CellPoint {
+                row: usize::try_from(row).unwrap_or(0),
+                column: found.start.column,
+            },
+            end: CellPoint {
+                row: usize::try_from(row).unwrap_or(0),
+                column: found.end.column,
+            },
+        });
+    }
+    SearchResult {
+        matches: visible,
+        active,
+        current: state.current,
+        total: state.matches.len(),
+    }
+}
+
+fn scroll_match_into_view(term: &mut Term<ModelEventListener>, found: BufferRange) {
+    let current_offset = i32::try_from(term.grid().display_offset()).unwrap_or(i32::MAX);
+    let screen_lines = i32::try_from(term.screen_lines()).unwrap_or(i32::MAX);
+    let current_row = found.start.line.saturating_add(current_offset);
+    if (0..screen_lines).contains(&current_row) {
+        return;
+    }
+    let history = term.total_lines().saturating_sub(term.screen_lines());
+    let desired = if found.start.line < 0 {
+        found.start.line.saturating_neg()
+    } else {
+        0
+    }
+    .min(i32::try_from(history).unwrap_or(i32::MAX));
+    term.scroll_display(Scroll::Delta(desired.saturating_sub(current_offset)));
+}
+
+fn extract_frame(
+    term: &Term<ModelEventListener>,
+    revision: u64,
+    damage: FrameDamage,
+    selection: Option<CellRange>,
+) -> TerminalFrame {
+    let size = TerminalSize::new(term.columns(), term.screen_lines());
+    let content = term.renderable_content();
+    let display_offset = content.display_offset;
+    let modes = terminal_modes(content.mode);
+    let display_offset_i32 = i32::try_from(display_offset).unwrap_or(i32::MAX);
+    let cursor_line = content
+        .cursor
+        .point
+        .line
+        .0
+        .saturating_add(display_offset_i32);
+    let cursor = TerminalCursor {
+        row: usize::try_from(cursor_line).unwrap_or(0),
+        column: content.cursor.point.column.0,
+        shape: cursor_shape(content.cursor.shape),
+        blinking: term.cursor_style().blinking,
+    };
+    let colors = *content.colors;
+    let cells = content
+        .display_iter
+        .filter_map(|indexed| {
+            let row =
+                usize::try_from(indexed.point.line.0.saturating_add(display_offset_i32)).ok()?;
+            (row < size.lines && damage_contains(&damage, row, indexed.point.column.0))
+                .then(|| render_cell(row, indexed.point.column.0, indexed.cell, &colors))
+        })
+        .collect();
+
+    TerminalFrame {
+        revision,
+        size,
+        damage,
+        cells,
+        cursor,
+        selection,
+        display_offset,
+        modes,
+    }
+}
+
+fn damage_contains(damage: &FrameDamage, row: usize, column: usize) -> bool {
+    match damage {
+        FrameDamage::Full => true,
+        FrameDamage::Partial(regions) => regions
+            .iter()
+            .any(|region| region.row == row && column >= region.left && column <= region.right),
+        FrameDamage::None => false,
     }
 }
 
@@ -523,6 +701,17 @@ mod tests {
     }
 
     #[test]
+    fn reports_incremental_damage_after_initial_frame() {
+        let terminal = AlacrittyTerminal::new(TerminalSize::new(20, 3));
+        assert!(matches!(terminal.frame().damage, FrameDamage::Full));
+        terminal.feed(b"x");
+        let frame = terminal.frame();
+        assert!(matches!(frame.damage, FrameDamage::Partial(_)));
+        assert!(frame.cells.iter().any(|cell| cell.text == "x"));
+        assert!(!matches!(terminal.frame().damage, FrameDamage::Full));
+    }
+
+    #[test]
     fn exposes_device_status_replies_for_the_host() {
         let terminal = AlacrittyTerminal::new(TerminalSize::new(80, 24));
         terminal.feed(b"\x1b[6n");
@@ -543,5 +732,46 @@ mod tests {
             case_sensitive: false,
         });
         assert_eq!(result.matches.len(), 1);
+        assert_eq!(result.total, 1);
+        assert_eq!(result.current, Some(0));
+    }
+
+    #[test]
+    fn searches_scrollback_and_scrolls_to_the_active_match() {
+        let terminal = AlacrittyTerminal::new_with_scrollback(TerminalSize::new(20, 3), 50);
+        for index in 0..10 {
+            terminal.feed(format!("needle-{index}\r\n").as_bytes());
+        }
+        let result = terminal.search(&SearchRequest {
+            query: "needle-0".into(),
+            case_sensitive: true,
+        });
+        assert_eq!(result.total, 1);
+        let visible = terminal.navigate_search(SearchDirection::Previous);
+        assert_eq!(visible.matches.len(), 1);
+        assert!(terminal.full_frame().display_offset > 0);
+    }
+
+    #[test]
+    fn session_restart_keeps_history_and_adds_a_marker() {
+        let terminal = AlacrittyTerminal::new(TerminalSize::new(40, 4));
+        terminal.feed(b"old output");
+        terminal.prepare_session_restart("PowerShell 7");
+        let text = terminal.visible_text();
+        assert!(text.contains("old output"));
+        assert!(text.contains("Matcha"));
+        assert!(text.contains("PowerShell 7"));
+    }
+
+    #[test]
+    #[ignore = "release-only 100,000-line performance acceptance"]
+    fn retains_configured_history_after_one_hundred_thousand_lines() {
+        let terminal = AlacrittyTerminal::new_with_scrollback(TerminalSize::new(120, 40), 50_000);
+        for index in 0..100_000 {
+            terminal.feed(format!("Matcha stress line {index}\r\n").as_bytes());
+        }
+        assert_eq!(terminal.scrollback_len(), 50_000);
+        terminal.feed(b"still interactive");
+        assert!(terminal.visible_text().contains("still interactive"));
     }
 }

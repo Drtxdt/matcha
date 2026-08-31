@@ -25,13 +25,24 @@ const PADDING_Y: f64 = 6.0;
 struct TerminalPaintUpdate {
     frame: Arc<TerminalFrame>,
     font_size: f32,
+    font_family: String,
     search: SearchResult,
     preedit: String,
+    cursor_visible: bool,
+    background: TerminalColor,
 }
 
 pub struct TerminalView {
     id: ViewId,
     state: TerminalPaintUpdate,
+    rows: Vec<Vec<CachedGlyph>>,
+}
+
+struct CachedGlyph {
+    column: usize,
+    layout: TextLayout,
+    underline: UnderlineStyle,
+    underline_color: TerminalColor,
 }
 
 pub fn register_bundled_fonts() {
@@ -50,25 +61,71 @@ pub fn register_bundled_fonts() {
 pub fn terminal_view(
     frame: RwSignal<Arc<TerminalFrame>>,
     font_size: RwSignal<f32>,
+    font_family: RwSignal<String>,
     search: RwSignal<SearchResult>,
     preedit: RwSignal<String>,
+    cursor_visible: RwSignal<bool>,
+    background: RwSignal<TerminalColor>,
 ) -> TerminalView {
     let id = ViewId::new();
     let initial = TerminalPaintUpdate {
         frame: frame.get_untracked(),
         font_size: font_size.get_untracked(),
+        font_family: font_family.get_untracked(),
         search: search.get_untracked(),
         preedit: preedit.get_untracked(),
+        cursor_visible: cursor_visible.get_untracked(),
+        background: background.get_untracked(),
     };
     create_effect(move |_| {
         id.update_state(TerminalPaintUpdate {
             frame: frame.get(),
             font_size: font_size.get(),
+            font_family: font_family.get(),
             search: search.get(),
             preedit: preedit.get(),
+            cursor_visible: cursor_visible.get(),
+            background: background.get(),
         });
     });
-    TerminalView { id, state: initial }
+    let mut view = TerminalView {
+        id,
+        state: initial,
+        rows: Vec::new(),
+    };
+    view.rebuild_all_rows();
+    view
+}
+
+impl TerminalView {
+    fn rebuild_all_rows(&mut self) {
+        self.rows = (0..self.state.frame.size.lines)
+            .map(|row| build_row(&self.state, row))
+            .collect();
+    }
+
+    fn rebuild_damaged_rows(&mut self) {
+        let damaged = match &self.state.frame.damage {
+            matcha_terminal::FrameDamage::Full => {
+                self.rebuild_all_rows();
+                return;
+            }
+            matcha_terminal::FrameDamage::Partial(regions) => regions
+                .iter()
+                .map(|region| region.row)
+                .collect::<std::collections::BTreeSet<_>>(),
+            matcha_terminal::FrameDamage::None => return,
+        };
+        if self.rows.len() != self.state.frame.size.lines {
+            self.rebuild_all_rows();
+            return;
+        }
+        for row in damaged {
+            if row < self.rows.len() {
+                self.rows[row] = build_row(&self.state, row);
+            }
+        }
+    }
 }
 
 impl View for TerminalView {
@@ -78,7 +135,14 @@ impl View for TerminalView {
 
     fn update(&mut self, _cx: &mut UpdateCx, state: Box<dyn Any>) {
         if let Ok(state) = state.downcast::<TerminalPaintUpdate>() {
+            let font_changed = self.state.font_size.to_bits() != state.font_size.to_bits()
+                || self.state.font_family != state.font_family;
             self.state = *state;
+            if font_changed {
+                self.rebuild_all_rows();
+            } else {
+                self.rebuild_damaged_rows();
+            }
             self.id.request_paint();
         }
     }
@@ -86,9 +150,8 @@ impl View for TerminalView {
     fn paint(&mut self, cx: &mut PaintCx) {
         let frame = &self.state.frame;
         let font_size = self.state.font_size;
-        let cell_width = cell_width(font_size);
-        let line_height = line_height(font_size);
-        let background = color(matcha_terminal::TerminalColor::rgb(18, 24, 20));
+        let (cell_width, line_height) = cell_metrics(font_size, &self.state.font_family);
+        let background = color(self.state.background);
         let layout = self.id.get_layout().unwrap_or_default();
         cx.fill(
             &Rect::new(
@@ -135,48 +198,33 @@ impl View for TerminalView {
             }
         }
 
-        let family = [
-            FamilyOwned::Name("JetBrains Mono NL".into()),
-            FamilyOwned::Monospace,
-        ];
-        for cell in &frame.cells {
-            if cell.style.wide_spacer || cell.text == " " {
-                continue;
-            }
-            let mut attrs = Attrs::new()
-                .font_size(font_size)
-                .family(&family)
-                .color(color(cell.foreground));
-            if cell.style.bold {
-                attrs = attrs.weight(Weight::BOLD);
-            }
-            if cell.style.italic {
-                attrs = attrs.style(Style::Italic);
-            }
-            let mut text = TextLayout::new();
-            text.set_text(&cell.text, AttrsList::new(attrs));
-            cx.draw_text(
-                &text,
-                Point::new(
-                    PADDING_X + cell.column as f64 * cell_width,
-                    PADDING_Y + cell.row as f64 * line_height,
-                ),
-            );
-
-            if cell.style.underline != UnderlineStyle::None {
-                let y = PADDING_Y + (cell.row + 1) as f64 * line_height - 2.0;
+        for (row, glyphs) in self.rows.iter().enumerate() {
+            for glyph in glyphs {
+                cx.draw_text(
+                    &glyph.layout,
+                    Point::new(
+                        PADDING_X + glyph.column as f64 * cell_width,
+                        PADDING_Y + row as f64 * line_height,
+                    ),
+                );
+                if glyph.underline == UnderlineStyle::None {
+                    continue;
+                }
+                let y = PADDING_Y + (row + 1) as f64 * line_height - 2.0;
                 cx.stroke(
                     &floem::peniko::kurbo::Line::new(
-                        (PADDING_X + cell.column as f64 * cell_width, y),
-                        (PADDING_X + (cell.column + 1) as f64 * cell_width, y),
+                        (PADDING_X + glyph.column as f64 * cell_width, y),
+                        (PADDING_X + (glyph.column + 1) as f64 * cell_width, y),
                     ),
-                    color(cell.underline_color),
+                    color(glyph.underline_color),
                     &Stroke::new(1.0),
                 );
             }
         }
 
-        paint_cursor(cx, frame, cell_width, line_height);
+        if self.state.cursor_visible {
+            paint_cursor(cx, frame, cell_width, line_height);
+        }
         if !self.state.preedit.is_empty() {
             paint_preedit(
                 cx,
@@ -190,17 +238,67 @@ impl View for TerminalView {
     }
 }
 
-pub fn cell_width(font_size: f32) -> f64 {
-    f64::from(font_size) * 0.62
+fn build_row(state: &TerminalPaintUpdate, row: usize) -> Vec<CachedGlyph> {
+    let family = [
+        FamilyOwned::Name(state.font_family.clone()),
+        FamilyOwned::Name("JetBrains Mono NL".into()),
+        FamilyOwned::Monospace,
+    ];
+    state
+        .frame
+        .cells
+        .iter()
+        .filter(|cell| cell.row == row && !cell.style.wide_spacer && cell.text != " ")
+        .map(|cell| {
+            let mut attrs = Attrs::new()
+                .font_size(state.font_size)
+                .family(&family)
+                .color(color(cell.foreground));
+            if cell.style.bold {
+                attrs = attrs.weight(Weight::BOLD);
+            }
+            if cell.style.italic {
+                attrs = attrs.style(Style::Italic);
+            }
+            let mut layout = TextLayout::new();
+            layout.set_text(&cell.text, AttrsList::new(attrs));
+            CachedGlyph {
+                column: cell.column,
+                layout,
+                underline: cell.style.underline,
+                underline_color: cell.underline_color,
+            }
+        })
+        .collect()
 }
 
-pub fn line_height(font_size: f32) -> f64 {
-    f64::from(font_size) * 1.4
+pub fn cell_metrics(font_size: f32, font_family: &str) -> (f64, f64) {
+    let family = [
+        FamilyOwned::Name(font_family.to_owned()),
+        FamilyOwned::Name("JetBrains Mono NL".into()),
+        FamilyOwned::Monospace,
+    ];
+    let mut layout = TextLayout::new();
+    layout.set_text(
+        "M",
+        AttrsList::new(Attrs::new().font_size(font_size).family(&family)),
+    );
+    let width = layout
+        .layout_runs()
+        .next()
+        .map_or(f64::from(font_size) * 0.62, |run| f64::from(run.line_w));
+    (width.max(1.0), f64::from(font_size) * 1.4)
 }
 
-pub fn point_to_cell(point: Point, font_size: f32, frame: &TerminalFrame) -> CellPoint {
-    let column = ((point.x - PADDING_X).max(0.0) / cell_width(font_size)).floor() as usize;
-    let row = ((point.y - PADDING_Y).max(0.0) / line_height(font_size)).floor() as usize;
+pub fn point_to_cell(
+    point: Point,
+    font_size: f32,
+    font_family: &str,
+    frame: &TerminalFrame,
+) -> CellPoint {
+    let (cell_width, line_height) = cell_metrics(font_size, font_family);
+    let column = ((point.x - PADDING_X).max(0.0) / cell_width).floor() as usize;
+    let row = ((point.y - PADDING_Y).max(0.0) / line_height).floor() as usize;
     CellPoint {
         row: row.min(frame.size.lines.saturating_sub(1)),
         column: column.min(frame.size.columns.saturating_sub(1)),
