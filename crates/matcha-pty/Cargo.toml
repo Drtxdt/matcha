@@ -1,0 +1,17 @@
+[package]
+name = "matcha-pty"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+crossbeam-channel.workspace = true
+matcha-core = { path = "../matcha-core" }
+matcha-terminal = { path = "../matcha-terminal" }
+portable-pty.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

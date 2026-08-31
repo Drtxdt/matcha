@@ -1,0 +1,21 @@
+[package]
+name = "matcha-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+crossbeam-channel.workspace = true
+floem.workspace = true
+floem_renderer.workspace = true
+matcha-config = { path = "../matcha-config" }
+matcha-core = { path = "../matcha-core" }
+matcha-pty = { path = "../matcha-pty" }
+matcha-terminal = { path = "../matcha-terminal" }
+parking_lot.workspace = true
+tracing.workspace = true
+sys-locale.workspace = true
+
+[lints]
+workspace = true
