@@ -13,5 +13,8 @@ matcha-terminal = { path = "../matcha-terminal" }
 portable-pty.workspace = true
 thiserror.workspace = true
 
+[dev-dependencies]
+matcha-config = { path = "../matcha-config" }
+
 [lints]
 workspace = true

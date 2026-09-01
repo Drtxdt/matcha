@@ -9,7 +9,7 @@
 mod terminal_view;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -32,7 +32,9 @@ use matcha_terminal::{
 };
 use parking_lot::Mutex;
 
-use crate::terminal_view::{cell_metrics, point_to_cell, terminal_view};
+use crate::terminal_view::{
+    TerminalViewSignals, cell_metrics, point_to_cell, resolve_font_family, terminal_view,
+};
 
 const INITIAL_COLUMNS: usize = 100;
 const INITIAL_LINES: usize = 30;
@@ -71,6 +73,7 @@ fn apply_frame_patch(signal: RwSignal<Arc<TerminalFrame>>, patch: TerminalFrame)
 enum SessionStatus {
     Starting,
     Running,
+    InputBlocked,
     Exited(u32),
     Failed,
 }
@@ -84,6 +87,7 @@ struct WorkspaceState {
     profile_name: Mutex<String>,
     event_tx: Sender<RoutedSessionEvent>,
     active_session_id: AtomicU64,
+    render_pending: RenderPending,
     config: Mutex<AppConfig>,
     config_path: std::path::PathBuf,
 }
@@ -147,7 +151,7 @@ fn app_view(loaded: ConfigLoad) -> impl IntoView {
         config.terminal.scrollback_lines,
     ));
     let terminal_model: Arc<dyn TerminalModel> = terminal.clone();
-    let (event_tx, event_rx) = bounded(64);
+    let (event_tx, event_rx) = bounded(8);
     let state = Arc::new(WorkspaceState {
         terminal: Arc::clone(&terminal),
         terminal_model,
@@ -157,6 +161,7 @@ fn app_view(loaded: ConfigLoad) -> impl IntoView {
         profile_name: Mutex::new(profile.name.clone()),
         event_tx,
         active_session_id: AtomicU64::new(0),
+        render_pending: RenderPending::default(),
         config: Mutex::new(config.clone()),
         config_path: loaded.path,
     });
@@ -164,6 +169,11 @@ fn app_view(loaded: ConfigLoad) -> impl IntoView {
     let frame = create_rw_signal(Arc::new(terminal.full_frame()));
     let font_size = create_rw_signal(config.terminal.font_size);
     let font_family = create_rw_signal(config.terminal.font_family.clone());
+    let initial_font = resolve_font_family(&config.terminal.font_family);
+    let resolved_font_family = create_rw_signal(initial_font.family);
+    let font_fallback = create_rw_signal(initial_font.used_fallback);
+    let line_height = create_rw_signal(config.terminal.line_height);
+    let display_scale = create_rw_signal(1.0_f64);
     let scrollback_lines = create_rw_signal(config.terminal.scrollback_lines);
     let copy_on_select = create_rw_signal(config.clipboard.copy_on_select);
     let confirm_multiline = create_rw_signal(config.clipboard.confirm_multiline_paste);
@@ -213,6 +223,9 @@ fn app_view(loaded: ConfigLoad) -> impl IntoView {
             let Some(routed) = event_signal.get() else {
                 return;
             };
+            if matches!(&routed.event, SessionEvent::Output) {
+                state.render_pending.consume();
+            }
             if routed.session_id != state.active_session_id.load(Ordering::Acquire) {
                 return;
             }
@@ -293,6 +306,9 @@ fn app_view(loaded: ConfigLoad) -> impl IntoView {
         let state = Arc::clone(&state);
         create_effect(move |_| {
             let family = font_family.get();
+            let resolution = resolve_font_family(&family);
+            resolved_font_family.set(resolution.family);
+            font_fallback.set(resolution.used_fallback);
             update_config(&state, |config| config.terminal.font_family = family);
         });
     }
@@ -302,15 +318,17 @@ fn app_view(loaded: ConfigLoad) -> impl IntoView {
         status.set(SessionStatus::Failed);
     }
 
-    let terminal_surface = terminal_view(
+    let terminal_surface = terminal_view(TerminalViewSignals {
         frame,
         font_size,
-        font_family,
-        search_results,
+        font_family: resolved_font_family,
+        line_height,
+        search: search_results,
         preedit,
         cursor_visible,
-        terminal_background,
-    )
+        background: terminal_background,
+        display_scale,
+    })
     .keyboard_navigable()
     .on_event_stop(EventListener::FocusGained, move |_| {
         terminal_focused.set(true);
@@ -334,6 +352,7 @@ fn app_view(loaded: ConfigLoad) -> impl IntoView {
                     search_open,
                     pending_paste,
                     confirm_multiline,
+                    status,
                 );
             }
         }
@@ -348,7 +367,7 @@ fn app_view(loaded: ConfigLoad) -> impl IntoView {
         move |event| {
             if let Event::ImeCommit(text) = event {
                 preedit.set(String::new());
-                write_session(&state, text.as_bytes().to_vec());
+                write_user_input(&state, text.as_bytes().to_vec(), status);
             }
         }
     })
@@ -364,7 +383,9 @@ fn app_view(loaded: ConfigLoad) -> impl IntoView {
                     let point = point_to_cell(
                         pointer.pos,
                         font_size.get_untracked(),
-                        &font_family.get_untracked(),
+                        &resolved_font_family.get_untracked(),
+                        line_height.get_untracked(),
+                        display_scale.get_untracked(),
                         &current_frame,
                     );
                     write_session(
@@ -385,7 +406,9 @@ fn app_view(loaded: ConfigLoad) -> impl IntoView {
                 let point = point_to_cell(
                     pointer.pos,
                     font_size.get_untracked(),
-                    &font_family.get_untracked(),
+                    &resolved_font_family.get_untracked(),
+                    line_height.get_untracked(),
+                    display_scale.get_untracked(),
                     &current_frame,
                 );
                 let selection = match pointer.count {
@@ -422,7 +445,9 @@ fn app_view(loaded: ConfigLoad) -> impl IntoView {
                     let end = point_to_cell(
                         pointer.pos,
                         font_size.get_untracked(),
-                        &font_family.get_untracked(),
+                        &resolved_font_family.get_untracked(),
+                        line_height.get_untracked(),
+                        display_scale.get_untracked(),
                         &current_frame,
                     );
                     terminal.set_selection(Some(CellRange {
@@ -437,7 +462,9 @@ fn app_view(loaded: ConfigLoad) -> impl IntoView {
                     let point = point_to_cell(
                         pointer.pos,
                         font_size.get_untracked(),
-                        &font_family.get_untracked(),
+                        &resolved_font_family.get_untracked(),
+                        line_height.get_untracked(),
+                        display_scale.get_untracked(),
                         &current_frame,
                     );
                     write_session(
@@ -467,7 +494,9 @@ fn app_view(loaded: ConfigLoad) -> impl IntoView {
                     let point = point_to_cell(
                         pointer.pos,
                         font_size.get_untracked(),
-                        &font_family.get_untracked(),
+                        &resolved_font_family.get_untracked(),
+                        line_height.get_untracked(),
+                        display_scale.get_untracked(),
                         &current_frame,
                     );
                     write_session(
@@ -505,7 +534,9 @@ fn app_view(loaded: ConfigLoad) -> impl IntoView {
                     let point = point_to_cell(
                         pointer.pos,
                         font_size.get_untracked(),
-                        &font_family.get_untracked(),
+                        &resolved_font_family.get_untracked(),
+                        line_height.get_untracked(),
+                        display_scale.get_untracked(),
                         &current_frame,
                     );
                     let kind = if pointer.delta.y >= 0.0 {
@@ -528,9 +559,12 @@ fn app_view(loaded: ConfigLoad) -> impl IntoView {
                     );
                     return;
                 }
-                let (_, line_height) =
-                    cell_metrics(font_size.get_untracked(), &font_family.get_untracked());
-                let lines = (pointer.delta.y / line_height).round() as i32;
+                let (_, cell_height) = cell_metrics(
+                    font_size.get_untracked(),
+                    &resolved_font_family.get_untracked(),
+                    line_height.get_untracked(),
+                );
+                let lines = (pointer.delta.y / cell_height).round() as i32;
                 if lines != 0 {
                     terminal.scroll(lines);
                     apply_frame_patch(frame, terminal.frame());
@@ -541,8 +575,11 @@ fn app_view(loaded: ConfigLoad) -> impl IntoView {
     .on_resize({
         let state = Arc::clone(&state);
         move |rect| {
-            let (width, height) =
-                cell_metrics(font_size.get_untracked(), &font_family.get_untracked());
+            let (width, height) = cell_metrics(
+                font_size.get_untracked(),
+                &resolved_font_family.get_untracked(),
+                line_height.get_untracked(),
+            );
             let columns = ((rect.width() - 16.0).max(width) / width).floor() as usize;
             let lines = ((rect.height() - 12.0).max(height) / height).floor() as usize;
             let size = TerminalSize::new(columns.max(2), lines.max(2));
@@ -599,6 +636,8 @@ fn app_view(loaded: ConfigLoad) -> impl IntoView {
                         &state,
                         font_size,
                         font_family,
+                        font_fallback,
+                        line_height,
                         scrollback_lines,
                         profile_editor,
                         copy_on_select,
@@ -632,7 +671,7 @@ fn app_view(loaded: ConfigLoad) -> impl IntoView {
                             let state = Arc::clone(&state);
                             move || {
                                 let modes = frame.get_untracked().modes;
-                                write_session(&state, encode_paste(&text, modes));
+                                write_user_input(&state, encode_paste(&text, modes), status);
                                 pending_paste.set(None);
                             }
                         },
@@ -695,6 +734,7 @@ fn app_view(loaded: ConfigLoad) -> impl IntoView {
 
 fn start_session(state: &Arc<WorkspaceState>) -> Result<(), matcha_pty::PtyError> {
     let session_id = state.active_session_id.fetch_add(1, Ordering::AcqRel) + 1;
+    state.render_pending.consume();
     let profile_config = state
         .config
         .lock()
@@ -711,17 +751,23 @@ fn start_session(state: &Arc<WorkspaceState>) -> Result<(), matcha_pty::PtyError
     let session = LocalPtySession::spawn(&profile, state.terminal.size(), &state.terminal_model)?;
     let events = session.events();
     let relay = state.event_tx.clone();
+    let relay_state = Arc::clone(state);
     thread::Builder::new()
         .name("matcha-ui-session-events".into())
         .spawn(move || {
             while let Ok(event) = events.recv() {
+                if relay_state.active_session_id.load(Ordering::Acquire) != session_id {
+                    break;
+                }
                 let routed = RoutedSessionEvent {
                     session_id,
                     event: event.clone(),
                 };
                 match event {
                     SessionEvent::Output => {
-                        let _ = relay.try_send(routed);
+                        if relay_state.render_pending.request() && relay.try_send(routed).is_err() {
+                            relay_state.render_pending.consume();
+                        }
                     }
                     SessionEvent::Exited { .. }
                     | SessionEvent::ReadFailed(_)
@@ -741,11 +787,32 @@ fn start_session(state: &Arc<WorkspaceState>) -> Result<(), matcha_pty::PtyError
     Ok(())
 }
 
-fn write_session(state: &WorkspaceState, bytes: Vec<u8>) {
+fn write_session(state: &WorkspaceState, bytes: Vec<u8>) -> bool {
     if let Some(session) = state.session.lock().as_ref()
         && let Err(error) = session.write(bytes)
     {
         tracing::error!(%error, "failed to write terminal input");
+        return false;
+    }
+    true
+}
+
+#[derive(Debug, Default)]
+struct RenderPending(AtomicBool);
+
+impl RenderPending {
+    fn request(&self) -> bool {
+        !self.0.swap(true, Ordering::AcqRel)
+    }
+
+    fn consume(&self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+fn write_user_input(state: &WorkspaceState, bytes: Vec<u8>, status: RwSignal<SessionStatus>) {
+    if !write_session(state, bytes) {
+        status.set(SessionStatus::InputBlocked);
     }
 }
 
@@ -759,6 +826,7 @@ fn handle_key(
     search_open: RwSignal<bool>,
     pending_paste: RwSignal<Option<String>>,
     confirm_multiline: RwSignal<bool>,
+    status: RwSignal<SessionStatus>,
 ) {
     let control = event.modifiers.control();
     let shift = event.modifiers.shift();
@@ -775,7 +843,11 @@ fn handle_key(
                     if confirm_multiline.get_untracked() && contains_multiple_lines(&text) {
                         pending_paste.set(Some(text));
                     } else {
-                        write_session(state, encode_paste(&text, frame.get_untracked().modes));
+                        write_user_input(
+                            state,
+                            encode_paste(&text, frame.get_untracked().modes),
+                            status,
+                        );
                     }
                 }
                 return;
@@ -809,13 +881,30 @@ fn handle_key(
         }
     }
     if let Some(input) = map_key(event) {
-        write_session(state, encode_key(&input, frame.get_untracked().modes));
+        write_user_input(
+            state,
+            encode_key(&input, frame.get_untracked().modes),
+            status,
+        );
     }
 }
 
 fn map_key(event: &floem::keyboard::KeyEvent) -> Option<KeyInput> {
-    let code = match &event.key.logical_key {
+    let code = map_logical_key(&event.key.logical_key)?;
+    Some(KeyInput {
+        code,
+        modifiers: Modifiers {
+            shift: event.modifiers.shift(),
+            alt: event.modifiers.alt(),
+            control: event.modifiers.control(),
+        },
+    })
+}
+
+fn map_logical_key(key: &Key) -> Option<KeyCode> {
+    Some(match key {
         Key::Character(character) => KeyCode::Character(character.to_string()),
+        Key::Named(NamedKey::Space) => KeyCode::Character(" ".into()),
         Key::Named(NamedKey::Enter) => KeyCode::Enter,
         Key::Named(NamedKey::Tab) => KeyCode::Tab,
         Key::Named(NamedKey::Backspace) => KeyCode::Backspace,
@@ -830,16 +919,8 @@ fn map_key(event: &floem::keyboard::KeyEvent) -> Option<KeyInput> {
         Key::Named(NamedKey::Delete) => KeyCode::Delete,
         Key::Named(NamedKey::PageUp) => KeyCode::PageUp,
         Key::Named(NamedKey::PageDown) => KeyCode::PageDown,
-        Key::Named(named) => function_number(*named).map(KeyCode::Function)?,
+        Key::Named(named) => KeyCode::Function(function_number(*named)?),
         _ => return None,
-    };
-    Some(KeyInput {
-        code,
-        modifiers: Modifiers {
-            shift: event.modifiers.shift(),
-            alt: event.modifiers.alt(),
-            control: event.modifiers.control(),
-        },
     })
 }
 
@@ -911,7 +992,9 @@ fn session_bar(
                     }
                 })
                 .into_any(),
-            SessionStatus::Starting | SessionStatus::Running => empty().into_any(),
+            SessionStatus::Starting | SessionStatus::Running | SessionStatus::InputBlocked => {
+                empty().into_any()
+            }
         }),
         button("⚙").on_click_stop(move |_| settings_open.set(true)),
     ))
@@ -948,6 +1031,7 @@ fn status_bar(
         label(move || match status.get() {
             SessionStatus::Starting => tr(locale.get(), "starting"),
             SessionStatus::Running => tr(locale.get(), "running"),
+            SessionStatus::InputBlocked => tr(locale.get(), "input_blocked"),
             SessionStatus::Exited(code) => format!("{} {code}", tr(locale.get(), "exited")),
             SessionStatus::Failed => tr(locale.get(), "failed"),
         }),
@@ -1048,6 +1132,8 @@ fn settings_overlay(
     state: &Arc<WorkspaceState>,
     font_size: RwSignal<f32>,
     font_family: RwSignal<String>,
+    font_fallback: RwSignal<bool>,
+    line_height: RwSignal<f32>,
     scrollback_lines: RwSignal<usize>,
     profile_editor: ProfileEditorSignals,
     copy_on_select: RwSignal<bool>,
@@ -1059,6 +1145,9 @@ fn settings_overlay(
 ) -> impl IntoView {
     let state_font_down = Arc::clone(state);
     let state_font_up = Arc::clone(state);
+    let state_line_height_down = Arc::clone(state);
+    let state_line_height_up = Arc::clone(state);
+    let state_line_height_reset = Arc::clone(state);
     let state_scrollback_down = Arc::clone(state);
     let state_scrollback_up = Arc::clone(state);
     let state_copy = Arc::clone(state);
@@ -1092,6 +1181,44 @@ fn settings_overlay(
         .style(|style| style.gap(8.0).items_center()),
         label(move || tr(locale.get(), "font_family")),
         text_input(font_family).style(|style| style.width(320.0)),
+        dyn_view(move || {
+            if font_fallback.get() {
+                label(move || {
+                    format!(
+                        "{}: {}",
+                        tr(locale.get(), "font_fallback"),
+                        matcha_config::DEFAULT_FONT_FAMILY
+                    )
+                })
+                .style(|style| style.color(Color::rgb8(218, 165, 75)))
+                .into_any()
+            } else {
+                empty().into_any()
+            }
+        }),
+        h_stack((
+            label(move || {
+                format!(
+                    "{}: {:.2}",
+                    tr(locale.get(), "line_height"),
+                    line_height.get()
+                )
+            }),
+            button("−").on_click_stop(move |_| {
+                change_line_height(&state_line_height_down, line_height, -0.05);
+            }),
+            button("+").on_click_stop(move |_| {
+                change_line_height(&state_line_height_up, line_height, 0.05);
+            }),
+            button(label(move || tr(locale.get(), "reset"))).on_click_stop(move |_| {
+                set_line_height(
+                    &state_line_height_reset,
+                    line_height,
+                    matcha_config::DEFAULT_LINE_HEIGHT,
+                );
+            }),
+        ))
+        .style(|style| style.gap(8.0).items_center()),
         h_stack((
             label(move || {
                 format!(
@@ -1528,6 +1655,20 @@ fn set_font_size(state: &WorkspaceState, signal: RwSignal<f32>, value: f32) {
     update_config(state, |config| config.terminal.font_size = value);
 }
 
+fn change_line_height(state: &WorkspaceState, signal: RwSignal<f32>, delta: f32) {
+    set_line_height(state, signal, signal.get_untracked() + delta);
+}
+
+fn set_line_height(state: &WorkspaceState, signal: RwSignal<f32>, value: f32) {
+    let value = (value * 100.0).round() / 100.0;
+    let value = value.clamp(
+        matcha_config::MIN_LINE_HEIGHT,
+        matcha_config::MAX_LINE_HEIGHT,
+    );
+    signal.set(value);
+    update_config(state, |config| config.terminal.line_height = value);
+}
+
 fn set_scrollback(state: &WorkspaceState, signal: RwSignal<usize>, value: usize) {
     let value = value.min(matcha_config::MAX_SCROLLBACK_LINES);
     signal.set(value);
@@ -1579,12 +1720,16 @@ fn tr(locale: LocalePreference, key: &str) -> String {
         (true, "restart") => "重新启动",
         (true, "starting") => "正在启动",
         (true, "running") => "运行中",
+        (true, "input_blocked") => "输入队列繁忙，请稍候",
         (true, "exited") => "已退出，代码",
         (true, "failed") => "会话失败",
         (true, "settings") => "设置",
         (true, "terminal") => "终端",
         (true, "font_size") => "字号",
         (true, "font_family") => "字体",
+        (true, "font_fallback") => "字体不可用，当前回退到",
+        (true, "line_height") => "行高",
+        (true, "reset") => "重置",
         (true, "scrollback") => "回滚行数",
         (true, "system") => "跟随系统",
         (true, "copy_on_select") => "选中即复制",
@@ -1613,12 +1758,16 @@ fn tr(locale: LocalePreference, key: &str) -> String {
         (false, "restart") => "Restart",
         (false, "starting") => "Starting",
         (false, "running") => "Running",
+        (false, "input_blocked") => "Input queue is busy",
         (false, "exited") => "Exited with code",
         (false, "failed") => "Session failed",
         (false, "settings") => "Settings",
         (false, "terminal") => "Terminal",
         (false, "font_size") => "Font size",
         (false, "font_family") => "Font family",
+        (false, "font_fallback") => "Font unavailable; using",
+        (false, "line_height") => "Line height",
+        (false, "reset") => "Reset",
         (false, "scrollback") => "Scrollback lines",
         (false, "system") => "System",
         (false, "copy_on_select") => "Copy on select",
@@ -1665,4 +1814,27 @@ fn preview(text: &str) -> String {
         preview.push_str("\n…");
     }
     preview
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_named_space_to_character_input() {
+        assert_eq!(
+            map_logical_key(&Key::Named(NamedKey::Space)),
+            Some(KeyCode::Character(" ".into()))
+        );
+    }
+
+    #[test]
+    fn coalesces_output_until_the_pending_frame_is_consumed() {
+        let pending = RenderPending::default();
+        assert!(pending.request());
+        assert!(!pending.request());
+        assert!(!pending.request());
+        pending.consume();
+        assert!(pending.request());
+    }
 }

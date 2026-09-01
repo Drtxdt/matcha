@@ -18,6 +18,8 @@ The test feeds 100,000 lines into a 120×40 terminal, verifies that exactly 50,0
 4. Exercise `Ctrl+Shift+C/V`, multi-line paste confirmation, search navigation, font zoom, mouse selection, and selection-with-Shift while an application has mouse tracking enabled.
 5. Verify Chinese IME preedit is drawn at the cursor and the committed text is sent exactly once.
 6. Leave an unchanged terminal visible for two minutes and measure Matcha's CPU use. Record the observed range; do not mark idle CPU passed from visual inspection alone.
+7. Compare the default 14 px / 1.15 line-height rendering beside Windows Terminal. Check ASCII tables, PowerShell prompts, box drawing, Chinese, emoji, combining accents, bold/italic text, and 125%/150% display scaling. Repeat after changing line height to 1.0 and 1.5; cursor, selection, search highlights, mouse hit testing, and PTY dimensions must remain aligned.
+8. Use a prompt with adjacent colored background cells. At 100%, 125%, and 150% scaling, verify there are no dark seams between cells or inside single-line, multi-line, and reversed selections. Type commands containing repeated spaces quickly and confirm every space reaches the shell in order.
 
 ## Ubuntu 22.04 and 24.04
 

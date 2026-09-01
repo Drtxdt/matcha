@@ -279,6 +279,35 @@ mod tests {
     }
 
     #[test]
+    fn encodes_space_and_modified_space() {
+        let space = key(KeyCode::Character(" ".into()));
+        assert_eq!(encode_key(&space, TerminalModes::default()), b" ");
+
+        let mut control_space = space.clone();
+        control_space.modifiers.control = true;
+        assert_eq!(encode_key(&control_space, TerminalModes::default()), b"\0");
+
+        let mut alt_space = space.clone();
+        alt_space.modifiers.alt = true;
+        assert_eq!(encode_key(&alt_space, TerminalModes::default()), b"\x1b ");
+
+        let mut shift_space = space.clone();
+        shift_space.modifiers.shift = true;
+        assert_eq!(encode_key(&shift_space, TerminalModes::default()), b" ");
+
+        assert_eq!(
+            encode_key(
+                &control_space,
+                TerminalModes {
+                    kitty_keyboard: true,
+                    ..TerminalModes::default()
+                }
+            ),
+            b"\x1b[32;5u"
+        );
+    }
+
+    #[test]
     fn respects_application_cursor_mode() {
         assert_eq!(
             encode_key(&key(KeyCode::Up), TerminalModes::default()),

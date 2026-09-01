@@ -14,10 +14,14 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+pub const CURRENT_SCHEMA_VERSION: u32 = 2;
 pub const DEFAULT_SCROLLBACK_LINES: usize = 50_000;
 pub const MAX_SCROLLBACK_LINES: usize = 1_000_000;
 pub const DEFAULT_FONT_SIZE: f32 = 14.0;
+pub const DEFAULT_FONT_FAMILY: &str = "JetBrains Mono NL";
+pub const DEFAULT_LINE_HEIGHT: f32 = 1.15;
+pub const MIN_LINE_HEIGHT: f32 = 1.0;
+pub const MAX_LINE_HEIGHT: f32 = 1.5;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -58,14 +62,16 @@ impl Default for AppearanceConfig {
 pub struct TerminalConfig {
     pub font_family: String,
     pub font_size: f32,
+    pub line_height: f32,
     pub scrollback_lines: usize,
 }
 
 impl Default for TerminalConfig {
     fn default() -> Self {
         Self {
-            font_family: "JetBrains Mono".into(),
+            font_family: DEFAULT_FONT_FAMILY.into(),
             font_size: DEFAULT_FONT_SIZE,
+            line_height: DEFAULT_LINE_HEIGHT,
             scrollback_lines: DEFAULT_SCROLLBACK_LINES,
         }
     }
@@ -138,8 +144,15 @@ impl Default for AppConfig {
 
 impl AppConfig {
     pub fn normalize(&mut self) {
+        if self.schema_version < 2 && self.terminal.font_family == "JetBrains Mono" {
+            self.terminal.font_family = DEFAULT_FONT_FAMILY.into();
+        }
         self.schema_version = CURRENT_SCHEMA_VERSION;
         self.terminal.font_size = self.terminal.font_size.clamp(8.0, 48.0);
+        self.terminal.line_height = self
+            .terminal
+            .line_height
+            .clamp(MIN_LINE_HEIGHT, MAX_LINE_HEIGHT);
         self.terminal.scrollback_lines = self.terminal.scrollback_lines.min(MAX_SCROLLBACK_LINES);
         if self.shell_profiles.is_empty() {
             self.shell_profiles = discover_shell_profiles();
@@ -408,6 +421,8 @@ mod tests {
         let config = AppConfig::default();
         assert_eq!(config.schema_version, CURRENT_SCHEMA_VERSION);
         assert!((config.terminal.font_size - 14.0).abs() < f32::EPSILON);
+        assert_eq!(config.terminal.font_family, DEFAULT_FONT_FAMILY);
+        assert!((config.terminal.line_height - DEFAULT_LINE_HEIGHT).abs() < f32::EPSILON);
         assert_eq!(config.terminal.scrollback_lines, 50_000);
         assert!(!config.clipboard.copy_on_select);
         assert!(config.clipboard.confirm_multiline_paste);
@@ -471,16 +486,35 @@ mod tests {
         let path = directory.join("config.toml");
         let mut config = AppConfig::default();
         config.terminal.font_size = 200.0;
+        config.terminal.line_height = 9.0;
         config.terminal.scrollback_lines = usize::MAX;
         save(&path, &config).expect("config should save");
 
         let loaded = load_from_path(&path);
         assert!((loaded.config.terminal.font_size - 48.0).abs() < f32::EPSILON);
+        assert!((loaded.config.terminal.line_height - MAX_LINE_HEIGHT).abs() < f32::EPSILON);
         assert_eq!(
             loaded.config.terminal.scrollback_lines,
             MAX_SCROLLBACK_LINES
         );
 
         fs::remove_dir_all(directory).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn migrates_v1_font_and_line_height_defaults() {
+        let source = r#"
+            schema_version = 1
+
+            [terminal]
+            font_family = "JetBrains Mono"
+            font_size = 14.0
+            scrollback_lines = 50000
+        "#;
+        let mut config: AppConfig = toml::from_str(source).expect("v1 config should parse");
+        config.normalize();
+        assert_eq!(config.schema_version, 2);
+        assert_eq!(config.terminal.font_family, DEFAULT_FONT_FAMILY);
+        assert!((config.terminal.line_height - DEFAULT_LINE_HEIGHT).abs() < f32::EPSILON);
     }
 }

@@ -22,6 +22,7 @@ cargo build --workspace --release
 - Drag/double-click/triple-click selects characters/words/lines. Hold `Shift` to force local selection or scrolling while an application owns the mouse.
 
 The default configuration is stored in the platform-standard Matcha configuration directory. Invalid TOML is backed up before defaults are restored.
+The bundled `JetBrains Mono NL` font is the terminal default. Font size and compact line height can be adjusted independently; unavailable custom font names visibly fall back to the bundled font.
 
 Supported desktop targets for the first release are Windows 10/11 and Ubuntu 22.04/24.04.
 

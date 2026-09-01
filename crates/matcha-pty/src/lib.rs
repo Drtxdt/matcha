@@ -75,6 +75,8 @@ impl LocalPtySession {
 
         let mut command = CommandBuilder::new(&shell.program);
         command.args(&shell.args);
+        command.env("TERM", "xterm-256color");
+        command.env("COLORTERM", "truecolor");
         if let Some(cwd) = &shell.cwd {
             command.cwd(cwd);
         }
@@ -87,8 +89,8 @@ impl LocalPtySession {
             .try_clone_reader()
             .map_err(PtyError::CloneReader)?;
         let mut writer = pair.master.take_writer().map_err(PtyError::Writer)?;
-        let (input_tx, input_rx) = bounded::<Vec<u8>>(128);
-        let (event_tx, event_rx) = bounded::<SessionEvent>(64);
+        let (input_tx, input_rx) = bounded::<Vec<u8>>(256);
+        let (event_tx, event_rx) = bounded::<SessionEvent>(2);
 
         // Waiting is required to reliably drain Windows ConPTY output. Keep it
         // off the UI thread and retain a separate killer handle for shutdown.
@@ -131,7 +133,14 @@ impl LocalPtySession {
         let writer_thread = thread::Builder::new()
             .name("matcha-pty-writer".into())
             .spawn(move || {
-                while let Ok(bytes) = input_rx.recv() {
+                while let Ok(first) = input_rx.recv() {
+                    let mut bytes = first;
+                    while bytes.len() < 64 * 1024 {
+                        let Ok(next) = input_rx.try_recv() else {
+                            break;
+                        };
+                        bytes.extend_from_slice(&next);
+                    }
                     if let Err(error) = writer.write_all(&bytes).and_then(|()| writer.flush()) {
                         let _ = event_tx.send(SessionEvent::WriteFailed(error.to_string()));
                         return;
@@ -261,20 +270,84 @@ mod tests {
 
     #[test]
     fn local_shell_output_reaches_terminal_model() {
+        exercise_shell(&marker_shell());
+    }
+
+    #[test]
+    fn terminal_environment_enables_modern_color_prompts() {
         let shell = marker_shell();
         let terminal = Arc::new(AlacrittyTerminal::new(TerminalSize::new(80, 12)));
         let terminal_model: Arc<dyn TerminalModel> = terminal.clone();
         let session = LocalPtySession::spawn(&shell, terminal.size(), &terminal_model)
             .expect("local PTY should start");
         session
-            .write(marker_input())
-            .expect("marker command should be written");
+            .write(color_environment_command())
+            .expect("environment command should queue");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let visible = terminal.visible_text();
+            if visible.contains("xterm-256color") && visible.contains("truecolor") {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!(
+            "terminal color environment was not visible: {:?}",
+            terminal.visible_text()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn every_discovered_windows_shell_runs_and_exits_cleanly() {
+        let profiles = matcha_config::discover_shell_profiles();
+        assert!(
+            profiles
+                .iter()
+                .any(|profile| profile.id == "windows-powershell")
+        );
+        assert!(
+            profiles
+                .iter()
+                .any(|profile| profile.id == "command-prompt")
+        );
+        for profile in profiles {
+            exercise_shell(&ShellProfile {
+                program: profile.program,
+                args: profile.args,
+                cwd: profile.startup_directory,
+            });
+        }
+    }
+
+    fn exercise_shell(shell: &ShellProfile) {
+        let terminal = Arc::new(AlacrittyTerminal::new(TerminalSize::new(80, 12)));
+        let terminal_model: Arc<dyn TerminalModel> = terminal.clone();
+        let session = LocalPtySession::spawn(shell, terminal.size(), &terminal_model)
+            .expect("local PTY should start");
+        for byte in marker_input() {
+            session
+                .write(vec![*byte])
+                .expect("marker command byte should be queued");
+        }
         let events = session.events();
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut observed = Vec::new();
+        let mut marker_seen = false;
+        let mut clean_exit = false;
 
         while Instant::now() < deadline {
-            if terminal.visible_text().contains("MATCHA_PTY_OK") {
+            marker_seen |= terminal.visible_text().contains("MATCHA_PTY_OK  SPACE_OK");
+            clean_exit |= observed.iter().any(|event| {
+                matches!(
+                    event,
+                    SessionEvent::Exited {
+                        code: 0,
+                        signal: None
+                    }
+                )
+            });
+            if marker_seen && clean_exit {
                 return;
             }
 
@@ -287,8 +360,42 @@ mod tests {
         }
 
         panic!(
-            "PTY marker did not reach terminal; events: {observed:?}; visible output: {:?}",
+            "PTY shell {:?} did not produce its marker and clean exit; events: {observed:?}; visible output: {:?}",
+            shell.program,
             terminal.visible_text(),
+        );
+    }
+
+    #[test]
+    #[ignore = "release-only local shell echo latency acceptance"]
+    fn local_shell_echo_p95_is_below_fifty_milliseconds() {
+        let terminal = Arc::new(AlacrittyTerminal::new(TerminalSize::new(100, 20)));
+        let terminal_model: Arc<dyn TerminalModel> = terminal.clone();
+        let session = LocalPtySession::spawn(&marker_shell(), terminal.size(), &terminal_model)
+            .expect("local PTY should start");
+        let mut samples = Vec::with_capacity(100);
+        for index in 0..105 {
+            let marker = format!("MATCHA_LATENCY_{index}");
+            let command = latency_command(&marker);
+            let started = Instant::now();
+            session
+                .write(command)
+                .expect("latency command should queue");
+            let deadline = started + Duration::from_secs(2);
+            while !terminal.visible_text().contains(&marker) {
+                assert!(Instant::now() < deadline, "shell did not echo {marker}");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            if index >= 5 {
+                samples.push(started.elapsed());
+            }
+        }
+        samples.sort_unstable();
+        let p95 = samples[94];
+        eprintln!("local shell echo p95: {p95:?}");
+        assert!(
+            p95 <= Duration::from_millis(50),
+            "local shell echo p95 exceeded 50 ms: {p95:?}"
         );
     }
 
@@ -303,7 +410,17 @@ mod tests {
 
     #[cfg(windows)]
     fn marker_input() -> &'static [u8] {
-        b"echo MATCHA_PTY_OK\r\nexit\r\n"
+        b"echo MATCHA_PTY_OK  SPACE_OK\r\nexit\r\n"
+    }
+
+    #[cfg(windows)]
+    fn latency_command(marker: &str) -> Vec<u8> {
+        format!("echo {marker}\r\n").into_bytes()
+    }
+
+    #[cfg(windows)]
+    fn color_environment_command() -> &'static [u8] {
+        b"echo %TERM% %COLORTERM%\r\n"
     }
 
     #[cfg(not(windows))]
@@ -317,6 +434,16 @@ mod tests {
 
     #[cfg(not(windows))]
     fn marker_input() -> &'static [u8] {
-        b"printf MATCHA_PTY_OK\nexit\n"
+        b"printf 'MATCHA_PTY_OK  SPACE_OK\\n'\nexit\n"
+    }
+
+    #[cfg(not(windows))]
+    fn latency_command(marker: &str) -> Vec<u8> {
+        format!("printf '{marker}\\n'\n").into_bytes()
+    }
+
+    #[cfg(not(windows))]
+    fn color_environment_command() -> &'static [u8] {
+        b"printf '%s %s\\n' \"$TERM\" \"$COLORTERM\"\n"
     }
 }
