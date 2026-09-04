@@ -15,10 +15,11 @@ use std::time::Duration;
 
 use crossbeam_channel::{Sender, bounded};
 use floem::Clipboard;
+use floem::ViewId;
 use floem::action::{exec_after, set_ime_allowed};
 use floem::event::{Event, EventListener};
 use floem::ext_event::create_signal_from_channel;
-use floem::keyboard::{Key, NamedKey};
+use floem::keyboard::{Key, KeyCode as FloemKeyCode, NamedKey, PhysicalKey};
 use floem::prelude::*;
 use floem::reactive::{RwSignal, SignalGet, SignalUpdate, create_effect, create_rw_signal};
 use matcha_config::{AppConfig, ConfigLoad, LocalePreference, ShellProfileConfig, ThemePreference};
@@ -318,7 +319,7 @@ fn app_view(loaded: ConfigLoad) -> impl IntoView {
         status.set(SessionStatus::Failed);
     }
 
-    let terminal_surface = terminal_view(TerminalViewSignals {
+    let terminal_widget = terminal_view(TerminalViewSignals {
         frame,
         font_size,
         font_family: resolved_font_family,
@@ -328,121 +329,91 @@ fn app_view(loaded: ConfigLoad) -> impl IntoView {
         cursor_visible,
         background: terminal_background,
         display_scale,
-    })
-    .keyboard_navigable()
-    .on_event_stop(EventListener::FocusGained, move |_| {
-        terminal_focused.set(true);
-        set_ime_allowed(true);
-    })
-    .on_event_stop(EventListener::FocusLost, move |_| {
-        terminal_focused.set(false);
-        set_ime_allowed(false);
-        preedit.set(String::new());
-    })
-    .on_event_stop(EventListener::KeyDown, {
-        let state = Arc::clone(&state);
-        move |event| {
-            if let Event::KeyDown(key) = event {
-                handle_key(
-                    key,
-                    &state,
-                    frame,
-                    font_size,
-                    settings_open,
-                    search_open,
-                    pending_paste,
-                    confirm_multiline,
-                    status,
-                );
-            }
-        }
-    })
-    .on_event_stop(EventListener::ImePreedit, move |event| {
-        if let Event::ImePreedit { text, .. } = event {
-            preedit.set(text.clone());
-        }
-    })
-    .on_event_stop(EventListener::ImeCommit, {
-        let state = Arc::clone(&state);
-        move |event| {
-            if let Event::ImeCommit(text) = event {
-                preedit.set(String::new());
-                write_user_input(&state, text.as_bytes().to_vec(), status);
-            }
-        }
-    })
-    .on_event_stop(EventListener::PointerDown, {
-        let terminal = Arc::clone(&terminal);
-        let state = Arc::clone(&state);
-        move |event| {
-            if let Event::PointerDown(pointer) = event {
-                let current_frame = frame.get_untracked();
-                if current_frame.modes.mouse_tracking && !pointer.modifiers.shift() {
-                    let button = terminal_mouse_button_from(pointer.button);
-                    terminal_mouse_button.set(button);
-                    let point = point_to_cell(
-                        pointer.pos,
-                        font_size.get_untracked(),
-                        &resolved_font_family.get_untracked(),
-                        line_height.get_untracked(),
-                        display_scale.get_untracked(),
-                        &current_frame,
-                    );
-                    write_session(
+    });
+    let terminal_view_id = terminal_widget.id();
+    let terminal_surface = terminal_widget
+        .keyboard_navigable()
+        .on_event_stop(EventListener::FocusGained, move |_| {
+            terminal_focused.set(true);
+            set_ime_allowed(true);
+        })
+        .on_event_stop(EventListener::FocusLost, move |_| {
+            terminal_focused.set(false);
+            set_ime_allowed(false);
+            preedit.set(String::new());
+        })
+        .on_event_stop(EventListener::KeyDown, {
+            let state = Arc::clone(&state);
+            move |event| {
+                if let Event::KeyDown(key) = event {
+                    handle_key(
+                        key,
                         &state,
-                        encode_mouse(
-                            MouseInput {
-                                kind: MouseKind::Press,
-                                button,
-                                row: point.row,
-                                column: point.column,
-                                modifiers: terminal_modifiers(pointer.modifiers),
-                            },
-                            current_frame.modes,
-                        ),
+                        frame,
+                        font_size,
+                        settings_open,
+                        search_open,
+                        pending_paste,
+                        confirm_multiline,
+                        status,
+                        terminal_view_id,
                     );
+                }
+            }
+        })
+        .on_event_stop(EventListener::ImePreedit, move |event| {
+            if settings_open.get_untracked() {
+                return;
+            }
+            if let Event::ImePreedit { text, .. } = event {
+                preedit.set(text.clone());
+            }
+        })
+        .on_event_stop(EventListener::ImeCommit, {
+            let state = Arc::clone(&state);
+            move |event| {
+                if settings_open.get_untracked() {
                     return;
                 }
-                let point = point_to_cell(
-                    pointer.pos,
-                    font_size.get_untracked(),
-                    &resolved_font_family.get_untracked(),
-                    line_height.get_untracked(),
-                    display_scale.get_untracked(),
-                    &current_frame,
-                );
-                let selection = match pointer.count {
-                    3.. => CellRange {
-                        start: CellPoint {
-                            row: point.row,
-                            column: 0,
-                        },
-                        end: CellPoint {
-                            row: point.row,
-                            column: current_frame.size.columns.saturating_sub(1),
-                        },
-                    },
-                    2 => semantic_range(&current_frame, point),
-                    _ => CellRange {
-                        start: point,
-                        end: point,
-                    },
-                };
-                selection_start.set(selection.start);
-                selecting.set(pointer.count == 1);
-                terminal.set_selection(Some(selection));
-                apply_frame_patch(frame, terminal.frame());
+                if let Event::ImeCommit(text) = event {
+                    preedit.set(String::new());
+                    write_user_input(&state, text.as_bytes().to_vec(), status);
+                }
             }
-        }
-    })
-    .on_event_stop(EventListener::PointerMove, {
-        let terminal = Arc::clone(&terminal);
-        let state = Arc::clone(&state);
-        move |event| {
-            if selecting.get_untracked() {
-                if let Event::PointerMove(pointer) = event {
+        })
+        .on_event_stop(EventListener::PointerDown, {
+            let terminal = Arc::clone(&terminal);
+            let state = Arc::clone(&state);
+            move |event| {
+                if let Event::PointerDown(pointer) = event {
                     let current_frame = frame.get_untracked();
-                    let end = point_to_cell(
+                    if current_frame.modes.mouse_tracking && !pointer.modifiers.shift() {
+                        let button = terminal_mouse_button_from(pointer.button);
+                        terminal_mouse_button.set(button);
+                        let point = point_to_cell(
+                            pointer.pos,
+                            font_size.get_untracked(),
+                            &resolved_font_family.get_untracked(),
+                            line_height.get_untracked(),
+                            display_scale.get_untracked(),
+                            &current_frame,
+                        );
+                        write_session(
+                            &state,
+                            encode_mouse(
+                                MouseInput {
+                                    kind: MouseKind::Press,
+                                    button,
+                                    row: point.row,
+                                    column: point.column,
+                                    modifiers: terminal_modifiers(pointer.modifiers),
+                                },
+                                current_frame.modes,
+                            ),
+                        );
+                        return;
+                    }
+                    let point = point_to_cell(
                         pointer.pos,
                         font_size.get_untracked(),
                         &resolved_font_family.get_untracked(),
@@ -450,147 +421,186 @@ fn app_view(loaded: ConfigLoad) -> impl IntoView {
                         display_scale.get_untracked(),
                         &current_frame,
                     );
-                    terminal.set_selection(Some(CellRange {
-                        start: selection_start.get_untracked(),
-                        end,
-                    }));
+                    let selection = match pointer.count {
+                        3.. => CellRange {
+                            start: CellPoint {
+                                row: point.row,
+                                column: 0,
+                            },
+                            end: CellPoint {
+                                row: point.row,
+                                column: current_frame.size.columns.saturating_sub(1),
+                            },
+                        },
+                        2 => semantic_range(&current_frame, point),
+                        _ => CellRange {
+                            start: point,
+                            end: point,
+                        },
+                    };
+                    selection_start.set(selection.start);
+                    selecting.set(pointer.count == 1);
+                    terminal.set_selection(Some(selection));
                     apply_frame_patch(frame, terminal.frame());
                 }
-            } else if let Event::PointerMove(pointer) = event {
-                let current_frame = frame.get_untracked();
-                if current_frame.modes.mouse_tracking && !pointer.modifiers.shift() {
-                    let point = point_to_cell(
-                        pointer.pos,
+            }
+        })
+        .on_event_stop(EventListener::PointerMove, {
+            let terminal = Arc::clone(&terminal);
+            let state = Arc::clone(&state);
+            move |event| {
+                if selecting.get_untracked() {
+                    if let Event::PointerMove(pointer) = event {
+                        let current_frame = frame.get_untracked();
+                        let end = point_to_cell(
+                            pointer.pos,
+                            font_size.get_untracked(),
+                            &resolved_font_family.get_untracked(),
+                            line_height.get_untracked(),
+                            display_scale.get_untracked(),
+                            &current_frame,
+                        );
+                        terminal.set_selection(Some(CellRange {
+                            start: selection_start.get_untracked(),
+                            end,
+                        }));
+                        apply_frame_patch(frame, terminal.frame());
+                    }
+                } else if let Event::PointerMove(pointer) = event {
+                    let current_frame = frame.get_untracked();
+                    if current_frame.modes.mouse_tracking && !pointer.modifiers.shift() {
+                        let point = point_to_cell(
+                            pointer.pos,
+                            font_size.get_untracked(),
+                            &resolved_font_family.get_untracked(),
+                            line_height.get_untracked(),
+                            display_scale.get_untracked(),
+                            &current_frame,
+                        );
+                        write_session(
+                            &state,
+                            encode_mouse(
+                                MouseInput {
+                                    kind: MouseKind::Move,
+                                    button: terminal_mouse_button.get_untracked(),
+                                    row: point.row,
+                                    column: point.column,
+                                    modifiers: terminal_modifiers(pointer.modifiers),
+                                },
+                                current_frame.modes,
+                            ),
+                        );
+                    }
+                }
+            }
+        })
+        .on_event_stop(EventListener::PointerUp, {
+            let terminal = Arc::clone(&terminal);
+            let state = Arc::clone(&state);
+            move |event| {
+                if let Event::PointerUp(pointer) = event {
+                    let current_frame = frame.get_untracked();
+                    if current_frame.modes.mouse_tracking && !pointer.modifiers.shift() {
+                        let point = point_to_cell(
+                            pointer.pos,
+                            font_size.get_untracked(),
+                            &resolved_font_family.get_untracked(),
+                            line_height.get_untracked(),
+                            display_scale.get_untracked(),
+                            &current_frame,
+                        );
+                        write_session(
+                            &state,
+                            encode_mouse(
+                                MouseInput {
+                                    kind: MouseKind::Release,
+                                    button: terminal_mouse_button.get_untracked(),
+                                    row: point.row,
+                                    column: point.column,
+                                    modifiers: terminal_modifiers(pointer.modifiers),
+                                },
+                                current_frame.modes,
+                            ),
+                        );
+                        terminal_mouse_button.set(TerminalMouseButton::None);
+                        return;
+                    }
+                }
+                selecting.set(false);
+                if copy_on_select.get_untracked()
+                    && let Some(text) = terminal.selection_text()
+                {
+                    let _ = Clipboard::set_contents(text);
+                }
+            }
+        })
+        .on_event_stop(EventListener::PointerWheel, {
+            let terminal = Arc::clone(&terminal);
+            let state = Arc::clone(&state);
+            move |event| {
+                if let Event::PointerWheel(pointer) = event {
+                    let current_frame = frame.get_untracked();
+                    if current_frame.modes.mouse_tracking && !pointer.modifiers.shift() {
+                        let point = point_to_cell(
+                            pointer.pos,
+                            font_size.get_untracked(),
+                            &resolved_font_family.get_untracked(),
+                            line_height.get_untracked(),
+                            display_scale.get_untracked(),
+                            &current_frame,
+                        );
+                        let kind = if pointer.delta.y >= 0.0 {
+                            MouseKind::WheelUp
+                        } else {
+                            MouseKind::WheelDown
+                        };
+                        write_session(
+                            &state,
+                            encode_mouse(
+                                MouseInput {
+                                    kind,
+                                    button: TerminalMouseButton::None,
+                                    row: point.row,
+                                    column: point.column,
+                                    modifiers: terminal_modifiers(pointer.modifiers),
+                                },
+                                current_frame.modes,
+                            ),
+                        );
+                        return;
+                    }
+                    let (_, cell_height) = cell_metrics(
                         font_size.get_untracked(),
                         &resolved_font_family.get_untracked(),
                         line_height.get_untracked(),
-                        display_scale.get_untracked(),
-                        &current_frame,
                     );
-                    write_session(
-                        &state,
-                        encode_mouse(
-                            MouseInput {
-                                kind: MouseKind::Move,
-                                button: terminal_mouse_button.get_untracked(),
-                                row: point.row,
-                                column: point.column,
-                                modifiers: terminal_modifiers(pointer.modifiers),
-                            },
-                            current_frame.modes,
-                        ),
-                    );
+                    let lines = (pointer.delta.y / cell_height).round() as i32;
+                    if lines != 0 {
+                        terminal.scroll(lines);
+                        apply_frame_patch(frame, terminal.frame());
+                    }
                 }
             }
-        }
-    })
-    .on_event_stop(EventListener::PointerUp, {
-        let terminal = Arc::clone(&terminal);
-        let state = Arc::clone(&state);
-        move |event| {
-            if let Event::PointerUp(pointer) = event {
-                let current_frame = frame.get_untracked();
-                if current_frame.modes.mouse_tracking && !pointer.modifiers.shift() {
-                    let point = point_to_cell(
-                        pointer.pos,
-                        font_size.get_untracked(),
-                        &resolved_font_family.get_untracked(),
-                        line_height.get_untracked(),
-                        display_scale.get_untracked(),
-                        &current_frame,
-                    );
-                    write_session(
-                        &state,
-                        encode_mouse(
-                            MouseInput {
-                                kind: MouseKind::Release,
-                                button: terminal_mouse_button.get_untracked(),
-                                row: point.row,
-                                column: point.column,
-                                modifiers: terminal_modifiers(pointer.modifiers),
-                            },
-                            current_frame.modes,
-                        ),
-                    );
-                    terminal_mouse_button.set(TerminalMouseButton::None);
-                    return;
-                }
-            }
-            selecting.set(false);
-            if copy_on_select.get_untracked()
-                && let Some(text) = terminal.selection_text()
-            {
-                let _ = Clipboard::set_contents(text);
-            }
-        }
-    })
-    .on_event_stop(EventListener::PointerWheel, {
-        let terminal = Arc::clone(&terminal);
-        let state = Arc::clone(&state);
-        move |event| {
-            if let Event::PointerWheel(pointer) = event {
-                let current_frame = frame.get_untracked();
-                if current_frame.modes.mouse_tracking && !pointer.modifiers.shift() {
-                    let point = point_to_cell(
-                        pointer.pos,
-                        font_size.get_untracked(),
-                        &resolved_font_family.get_untracked(),
-                        line_height.get_untracked(),
-                        display_scale.get_untracked(),
-                        &current_frame,
-                    );
-                    let kind = if pointer.delta.y >= 0.0 {
-                        MouseKind::WheelUp
-                    } else {
-                        MouseKind::WheelDown
-                    };
-                    write_session(
-                        &state,
-                        encode_mouse(
-                            MouseInput {
-                                kind,
-                                button: TerminalMouseButton::None,
-                                row: point.row,
-                                column: point.column,
-                                modifiers: terminal_modifiers(pointer.modifiers),
-                            },
-                            current_frame.modes,
-                        ),
-                    );
-                    return;
-                }
-                let (_, cell_height) = cell_metrics(
+        })
+        .on_resize({
+            let state = Arc::clone(&state);
+            move |rect| {
+                let (width, height) = cell_metrics(
                     font_size.get_untracked(),
                     &resolved_font_family.get_untracked(),
                     line_height.get_untracked(),
                 );
-                let lines = (pointer.delta.y / cell_height).round() as i32;
-                if lines != 0 {
-                    terminal.scroll(lines);
-                    apply_frame_patch(frame, terminal.frame());
+                let columns = ((rect.width() - 16.0).max(width) / width).floor() as usize;
+                let lines = ((rect.height() - 12.0).max(height) / height).floor() as usize;
+                let size = TerminalSize::new(columns.max(2), lines.max(2));
+                state.terminal.resize(size);
+                if let Some(session) = state.session.lock().as_ref() {
+                    let _ = session.resize(size);
                 }
+                apply_frame_patch(frame, state.terminal.frame());
             }
-        }
-    })
-    .on_resize({
-        let state = Arc::clone(&state);
-        move |rect| {
-            let (width, height) = cell_metrics(
-                font_size.get_untracked(),
-                &resolved_font_family.get_untracked(),
-                line_height.get_untracked(),
-            );
-            let columns = ((rect.width() - 16.0).max(width) / width).floor() as usize;
-            let lines = ((rect.height() - 12.0).max(height) / height).floor() as usize;
-            let size = TerminalSize::new(columns.max(2), lines.max(2));
-            state.terminal.resize(size);
-            if let Some(session) = state.session.lock().as_ref() {
-                let _ = session.resize(size);
-            }
-            apply_frame_patch(frame, state.terminal.frame());
-        }
-    })
-    .style(|style| style.size_full().min_height(120.0));
+        })
+        .style(|style| style.size_full().min_height(120.0));
 
     let chrome = v_stack((
         session_bar(
@@ -598,14 +608,17 @@ fn app_view(loaded: ConfigLoad) -> impl IntoView {
             title,
             status,
             settings_open,
-            locale,
             theme,
             system_dark,
         ),
         terminal_surface,
         status_bar(frame, status, locale, theme, system_dark),
     ))
-    .style(floem::style::Style::size_full);
+    .style(move |style| {
+        style
+            .size_full()
+            .apply_if(settings_open.get(), floem::style::Style::hide)
+    });
 
     stack((
         chrome.into_any(),
@@ -646,6 +659,7 @@ fn app_view(loaded: ConfigLoad) -> impl IntoView {
                         theme,
                         system_dark,
                         settings_open,
+                        terminal_view_id,
                     )
                     .into_any()
                 } else {
@@ -827,9 +841,23 @@ fn handle_key(
     pending_paste: RwSignal<Option<String>>,
     confirm_multiline: RwSignal<bool>,
     status: RwSignal<SessionStatus>,
+    terminal_view_id: ViewId,
 ) {
     let control = event.modifiers.control();
     let shift = event.modifiers.shift();
+    match settings_input_action(
+        settings_open.get_untracked(),
+        control,
+        &event.key.logical_key,
+        event.key.physical_key,
+    ) {
+        SettingsInputAction::Close => {
+            close_settings(settings_open, terminal_view_id);
+            return;
+        }
+        SettingsInputAction::Consume => return,
+        SettingsInputAction::PassToTerminal => {}
+    }
     if control && shift {
         match &event.key.logical_key {
             Key::Character(character) if character.eq_ignore_ascii_case("c") => {
@@ -854,6 +882,10 @@ fn handle_key(
             }
             _ => {}
         }
+    }
+    if control && is_settings_key(&event.key.logical_key, event.key.physical_key) {
+        settings_open.set(true);
+        return;
     }
     if control && let Key::Character(character) = &event.key.logical_key {
         match character.as_str() {
@@ -887,6 +919,41 @@ fn handle_key(
             status,
         );
     }
+}
+
+fn is_settings_key(key: &Key, physical_key: PhysicalKey) -> bool {
+    matches!(key, Key::Character(character) if character == ",")
+        || matches!(physical_key, PhysicalKey::Code(FloemKeyCode::Comma))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SettingsInputAction {
+    PassToTerminal,
+    Close,
+    Consume,
+}
+
+fn settings_input_action(
+    open: bool,
+    control: bool,
+    key: &Key,
+    physical_key: PhysicalKey,
+) -> SettingsInputAction {
+    if !open {
+        SettingsInputAction::PassToTerminal
+    } else if matches!(key, Key::Named(NamedKey::Escape))
+        || control && is_settings_key(key, physical_key)
+    {
+        SettingsInputAction::Close
+    } else {
+        SettingsInputAction::Consume
+    }
+}
+
+fn close_settings(open: RwSignal<bool>, terminal_view_id: ViewId) {
+    open.set(false);
+    terminal_view_id.request_focus();
+    set_ime_allowed(true);
 }
 
 fn map_key(event: &floem::keyboard::KeyEvent) -> Option<KeyInput> {
@@ -968,35 +1035,52 @@ fn session_bar(
     title: RwSignal<String>,
     status: RwSignal<SessionStatus>,
     settings_open: RwSignal<bool>,
-    locale: RwSignal<LocalePreference>,
     theme: RwSignal<ThemePreference>,
     system_dark: RwSignal<bool>,
 ) -> impl IntoView {
     let state_restart = Arc::clone(&state);
     h_stack((
         label(|| "Matcha").style(|style| style.font_size(18.0).font_bold()),
+        button("↻")
+            .on_click_stop(move |_| {
+                status.set(SessionStatus::Starting);
+                if start_session(&state_restart).is_err() {
+                    status.set(SessionStatus::Failed);
+                }
+            })
+            .style(|style| style.size(32.0, 32.0).flex_shrink(0.0)),
+        button("⚙")
+            .on_click_stop(move |_| settings_open.set(true))
+            .style(move |style| {
+                let light = matches!(theme.get(), ThemePreference::Light)
+                    || matches!(theme.get(), ThemePreference::System) && !system_dark.get();
+                style
+                    .size(32.0, 32.0)
+                    .flex_shrink(0.0)
+                    .color(if light {
+                        Color::rgb8(30, 44, 33)
+                    } else {
+                        Color::rgb8(226, 235, 226)
+                    })
+                    .background(if light {
+                        Color::rgb8(205, 218, 207)
+                    } else {
+                        Color::rgb8(49, 66, 55)
+                    })
+            }),
         label({
             let state = Arc::clone(&state);
             move || format!("{} · {}", state.profile_name.lock(), title.get())
         })
-        .style(|style| style.flex_grow(1.0_f32)),
-        dyn_view(move || match status.get() {
-            SessionStatus::Exited(_) | SessionStatus::Failed => button(tr(locale.get(), "restart"))
-                .on_click_stop({
-                    let state = Arc::clone(&state_restart);
-                    move |_| {
-                        status.set(SessionStatus::Starting);
-                        if start_session(&state).is_err() {
-                            status.set(SessionStatus::Failed);
-                        }
-                    }
-                })
-                .into_any(),
-            SessionStatus::Starting | SessionStatus::Running | SessionStatus::InputBlocked => {
-                empty().into_any()
-            }
+        .style(|style| {
+            style
+                .flex_grow(1.0_f32)
+                .flex_shrink(1.0_f32)
+                .flex_basis(0.0)
+                .width(0.0)
+                .min_width(0.0)
+                .text_ellipsis()
         }),
-        button("⚙").on_click_stop(move |_| settings_open.set(true)),
     ))
     .style(move |style| {
         let light = matches!(theme.get(), ThemePreference::Light)
@@ -1004,9 +1088,9 @@ fn session_bar(
         style
             .width_full()
             .height(44.0)
-            .items_center()
-            .gap(12.0)
             .padding_horiz(14.0)
+            .gap(12.0)
+            .items_center()
             .color(if light {
                 Color::rgb8(30, 44, 33)
             } else {
@@ -1142,6 +1226,7 @@ fn settings_overlay(
     theme: RwSignal<ThemePreference>,
     system_dark: RwSignal<bool>,
     open: RwSignal<bool>,
+    terminal_view_id: ViewId,
 ) -> impl IntoView {
     let state_font_down = Arc::clone(state);
     let state_font_up = Arc::clone(state);
@@ -1158,14 +1243,22 @@ fn settings_overlay(
     let state_theme_dark = Arc::clone(state);
     let state_theme_light = Arc::clone(state);
     let state_theme_system = Arc::clone(state);
+    let header = h_stack((
+        label(move || tr(locale.get(), "settings"))
+            .style(|style| style.font_size(22.0).font_bold().flex_grow(1.0)),
+        button("×")
+            .on_click_stop(move |_| close_settings(open, terminal_view_id))
+            .style(|style| style.size(36.0, 36.0)),
+    ))
+    .style(|style| {
+        style
+            .width_full()
+            .height(60.0)
+            .min_height(60.0)
+            .items_center()
+            .padding_horiz(24.0)
+    });
     let content = v_stack((
-        h_stack((
-            label(move || tr(locale.get(), "settings"))
-                .style(|style| style.font_size(22.0).font_bold()),
-            button("×")
-                .on_click_stop(move |_| open.set(false))
-                .style(|style| style.flex_grow(1.0_f32)),
-        )),
         label(move || tr(locale.get(), "terminal")).style(floem::style::Style::font_bold),
         h_stack((
             label(move || {
@@ -1308,24 +1401,55 @@ fn settings_overlay(
         label(move || tr(locale.get(), "shell")).style(|style| style.font_bold().margin_top(10.0)),
         profile_editor_view(Arc::clone(state), profile_editor, locale),
     ))
-    .style(|style| style.padding(28.0).gap(12.0).width_full());
-    scroll(content).style(move |style| {
-        let light = matches!(theme.get(), ThemePreference::Light)
-            || matches!(theme.get(), ThemePreference::System) && !system_dark.get();
+    .style(|style| {
         style
-            .absolute()
-            .inset(0.0)
-            .color(if light {
-                Color::rgb8(30, 44, 33)
-            } else {
-                Color::rgb8(228, 237, 228)
-            })
-            .background(if light {
-                Color::rgba8(247, 250, 247, 250)
-            } else {
-                Color::rgba8(28, 38, 31, 250)
-            })
-    })
+            .padding_horiz(28.0)
+            .padding_bottom(28.0)
+            .gap(12.0)
+            .width_full()
+            .max_width(760.0)
+    });
+    let centered_content = h_stack((
+        empty().style(|style| style.flex_grow(1.0)),
+        content,
+        empty().style(|style| style.flex_grow(1.0)),
+    ))
+    .style(floem::style::Style::width_full);
+    let body = scroll(centered_content).style(|style| style.size_full().flex_grow(1.0));
+    v_stack((header, body))
+        .keyboard_navigable()
+        .request_focus(|| {})
+        .on_event_stop(EventListener::KeyDown, move |event| {
+            if let Event::KeyDown(key) = event
+                && settings_input_action(
+                    true,
+                    key.modifiers.control(),
+                    &key.key.logical_key,
+                    key.key.physical_key,
+                ) == SettingsInputAction::Close
+            {
+                close_settings(open, terminal_view_id);
+            }
+        })
+        .style(move |style| {
+            let light = matches!(theme.get(), ThemePreference::Light)
+                || matches!(theme.get(), ThemePreference::System) && !system_dark.get();
+            style
+                .absolute()
+                .inset(0.0)
+                .size_full()
+                .z_index(1000)
+                .color(if light {
+                    Color::rgb8(30, 44, 33)
+                } else {
+                    Color::rgb8(228, 237, 228)
+                })
+                .background(if light {
+                    Color::rgb8(247, 250, 247)
+                } else {
+                    Color::rgb8(28, 38, 31)
+                })
+        })
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -1358,56 +1482,66 @@ fn profile_editor_view(
         )
         .style(|style| style.gap(4.0)),
         label(move || tr(locale.get(), "profile_name")),
-        text_input(editor.name).style(|style| style.width(420.0)),
+        text_input(editor.name).style(|style| style.width_full().max_width(700.0)),
         label(move || tr(locale.get(), "profile_program")),
-        text_input(editor.program).style(|style| style.width(420.0)),
+        text_input(editor.program).style(|style| style.width_full().max_width(700.0)),
         label(move || tr(locale.get(), "profile_args")),
-        text_input(editor.args_json).style(|style| style.width(420.0)),
+        text_input(editor.args_json).style(|style| style.width_full().max_width(700.0)),
         label(move || tr(locale.get(), "profile_cwd")),
-        text_input(editor.cwd).style(|style| style.width(420.0)),
-        h_stack((
-            button(label(move || tr(locale.get(), "save_profile"))).on_click_stop(move |_| {
-                save_profile(&state_save, save_editor);
-            }),
-            button(label(move || tr(locale.get(), "new_profile"))).on_click_stop(move |_| {
-                let profile = ShellProfileConfig {
-                    id: matcha_config::new_profile_id(),
-                    name: tr(locale.get_untracked(), "new_profile"),
-                    program: std::path::PathBuf::new(),
-                    args: Vec::new(),
-                    startup_directory: None,
-                };
-                add_editor
-                    .profiles
-                    .update(|profiles| profiles.push(profile.clone()));
-                select_profile(add_editor, &profile.id);
-            }),
-            button(label(move || tr(locale.get(), "duplicate_profile"))).on_click_stop(move |_| {
-                if let Some(mut profile) = selected_profile(duplicate_editor) {
-                    profile.id = matcha_config::new_profile_id();
-                    profile.name.push_str(" Copy");
-                    duplicate_editor
+        text_input(editor.cwd).style(|style| style.width_full().max_width(700.0)),
+        v_stack((
+            h_stack((
+                button(label(move || tr(locale.get(), "save_profile"))).on_click_stop(move |_| {
+                    save_profile(&state_save, save_editor);
+                }),
+                button(label(move || tr(locale.get(), "new_profile"))).on_click_stop(move |_| {
+                    let profile = ShellProfileConfig {
+                        id: matcha_config::new_profile_id(),
+                        name: tr(locale.get_untracked(), "new_profile"),
+                        program: std::path::PathBuf::new(),
+                        args: Vec::new(),
+                        startup_directory: None,
+                    };
+                    add_editor
                         .profiles
                         .update(|profiles| profiles.push(profile.clone()));
-                    select_profile(duplicate_editor, &profile.id);
-                }
-            }),
-            button(label(move || tr(locale.get(), "delete_profile"))).on_click_stop(move |_| {
-                delete_profile(&state_delete, delete_editor);
-            }),
-            button(label(move || tr(locale.get(), "set_default"))).on_click_stop(move |_| {
-                let selected = default_editor.selected_id.get_untracked();
-                if default_editor
-                    .profiles
-                    .get_untracked()
-                    .iter()
-                    .any(|profile| profile.id == selected)
-                {
-                    update_config(&state_default, |config| {
-                        config.default_shell_profile.clone_from(&selected);
-                    });
-                }
-            }),
+                    select_profile(add_editor, &profile.id);
+                }),
+                button(label(move || tr(locale.get(), "duplicate_profile"))).on_click_stop(
+                    move |_| {
+                        if let Some(mut profile) = selected_profile(duplicate_editor) {
+                            profile.id = matcha_config::new_profile_id();
+                            profile.name.push_str(" Copy");
+                            duplicate_editor
+                                .profiles
+                                .update(|profiles| profiles.push(profile.clone()));
+                            select_profile(duplicate_editor, &profile.id);
+                        }
+                    },
+                ),
+            ))
+            .style(|style| style.gap(6.0)),
+            h_stack((
+                button(label(move || tr(locale.get(), "delete_profile"))).on_click_stop(
+                    move |_| {
+                        delete_profile(&state_delete, delete_editor);
+                    },
+                ),
+                button(label(move || tr(locale.get(), "set_default"))).on_click_stop(move |_| {
+                    let selected = default_editor.selected_id.get_untracked();
+                    if default_editor
+                        .profiles
+                        .get_untracked()
+                        .iter()
+                        .any(|profile| profile.id == selected)
+                    {
+                        update_config(&state_default, |config| {
+                            config.default_shell_profile.clone_from(&selected);
+                        });
+                    }
+                }),
+            ))
+            .style(|style| style.gap(6.0)),
         ))
         .style(|style| style.gap(6.0)),
         dyn_view(move || {
@@ -1836,5 +1970,34 @@ mod tests {
         assert!(!pending.request());
         pending.consume();
         assert!(pending.request());
+    }
+
+    #[test]
+    fn settings_mode_consumes_terminal_input_and_supports_toggle_close() {
+        let ordinary = Key::Character("x".into());
+        let comma = Key::Character(",".into());
+        let escape = Key::Named(NamedKey::Escape);
+        let ordinary_physical = PhysicalKey::Code(FloemKeyCode::KeyX);
+        let comma_physical = PhysicalKey::Code(FloemKeyCode::Comma);
+        assert_eq!(
+            settings_input_action(false, false, &ordinary, ordinary_physical),
+            SettingsInputAction::PassToTerminal
+        );
+        assert_eq!(
+            settings_input_action(true, false, &ordinary, ordinary_physical),
+            SettingsInputAction::Consume
+        );
+        assert_eq!(
+            settings_input_action(true, true, &comma, ordinary_physical),
+            SettingsInputAction::Close
+        );
+        assert_eq!(
+            settings_input_action(true, true, &ordinary, comma_physical),
+            SettingsInputAction::Close
+        );
+        assert_eq!(
+            settings_input_action(true, false, &escape, ordinary_physical),
+            SettingsInputAction::Close
+        );
     }
 }

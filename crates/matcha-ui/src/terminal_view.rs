@@ -20,6 +20,7 @@ use matcha_terminal::{
 
 const PADDING_X: f64 = 8.0;
 const PADDING_Y: f64 = 6.0;
+const SYMBOL_FONT_FAMILY: &str = "Symbols Nerd Font Mono";
 static REGISTER_BUNDLED_FONTS: Once = Once::new();
 
 #[derive(Clone)]
@@ -78,11 +79,12 @@ pub struct FontResolution {
 }
 
 pub fn register_bundled_fonts() {
-    const FONTS: [&[u8]; 4] = [
+    const FONTS: [&[u8]; 5] = [
         include_bytes!("../assets/fonts/JetBrainsMonoNL-Regular.ttf"),
         include_bytes!("../assets/fonts/JetBrainsMonoNL-Bold.ttf"),
         include_bytes!("../assets/fonts/JetBrainsMonoNL-Italic.ttf"),
         include_bytes!("../assets/fonts/JetBrainsMonoNL-BoldItalic.ttf"),
+        include_bytes!("../assets/fonts/SymbolsNerdFontMono-Regular.ttf"),
     ];
     REGISTER_BUNDLED_FONTS.call_once(|| {
         let mut font_system = FONT_SYSTEM.lock();
@@ -310,7 +312,6 @@ impl View for TerminalView {
 }
 
 fn build_row(state: &TerminalPaintUpdate, row: usize) -> Vec<CachedGlyph> {
-    let family = [FamilyOwned::Name(state.font_family.clone())];
     let cells = state
         .frame
         .cells
@@ -321,7 +322,8 @@ fn build_row(state: &TerminalPaintUpdate, row: usize) -> Vec<CachedGlyph> {
     let mut index = 0;
     while index < cells.len() {
         let first = cells[index];
-        let precise = first.style.wide || first.text.chars().count() != 1;
+        let symbol = uses_symbol_font(&first.text);
+        let precise = first.style.wide || first.text.chars().count() != 1 || symbol;
         let mut text = first.text.clone();
         let mut columns = if first.style.wide { 2 } else { 1 };
         let mut next = index + 1;
@@ -333,7 +335,9 @@ fn build_row(state: &TerminalPaintUpdate, row: usize) -> Vec<CachedGlyph> {
                     && cell.style.italic == first.style.italic
                     && cell.style.underline == first.style.underline
                     && cell.underline_color == first.underline_color;
-                let is_simple = !cell.style.wide && cell.text.chars().count() == 1;
+                let is_simple = !cell.style.wide
+                    && cell.text.chars().count() == 1
+                    && !uses_symbol_font(&cell.text);
                 if !is_contiguous || !same_style || !is_simple {
                     break;
                 }
@@ -343,6 +347,11 @@ fn build_row(state: &TerminalPaintUpdate, row: usize) -> Vec<CachedGlyph> {
             }
         }
         if text.chars().any(|character| character != ' ') {
+            let family = [FamilyOwned::Name(if symbol {
+                SYMBOL_FONT_FAMILY.into()
+            } else {
+                state.font_family.clone()
+            })];
             let mut attrs = Attrs::new()
                 .font_size(state.font_size)
                 .family(&family)
@@ -372,6 +381,17 @@ fn build_row(state: &TerminalPaintUpdate, row: usize) -> Vec<CachedGlyph> {
         index = next;
     }
     glyphs
+}
+
+fn uses_symbol_font(text: &str) -> bool {
+    text.chars().any(is_private_use_character)
+}
+
+fn is_private_use_character(character: char) -> bool {
+    matches!(
+        character as u32,
+        0xE000..=0xF8FF | 0xF0000..=0xFFFFD | 0x0010_0000..=0x0010_FFFD
+    )
 }
 
 pub fn cell_metrics(font_size: f32, font_family: &str, line_height: f32) -> (f64, f64) {
@@ -611,6 +631,66 @@ mod tests {
         assert!(row.len() < state.frame.cells.len());
         assert!(row.iter().any(|glyph| glyph.columns == 2));
         assert!(row.iter().any(|glyph| glyph.columns >= 3));
+    }
+
+    #[test]
+    fn bundled_nerd_symbols_have_glyphs_and_are_isolated_by_cell() {
+        register_bundled_fonts();
+        let terminal = AlacrittyTerminal::new(TerminalSize::new(20, 2));
+        terminal.feed("A󰍲B".as_bytes());
+        let state = TerminalPaintUpdate {
+            frame: Arc::new(terminal.full_frame()),
+            font_size: matcha_config::DEFAULT_FONT_SIZE,
+            font_family: matcha_config::DEFAULT_FONT_FAMILY.into(),
+            line_height: matcha_config::DEFAULT_LINE_HEIGHT,
+            search: SearchResult::default(),
+            preedit: String::new(),
+            cursor_visible: true,
+            background: TerminalColor::rgb(0, 0, 0),
+        };
+        let row = build_row(&state, 0);
+        assert_eq!(
+            row.iter().map(|glyph| glyph.column).collect::<Vec<_>>(),
+            (0..8).collect::<Vec<_>>()
+        );
+        assert!(row[1..7].iter().all(|glyph| glyph.columns == 1));
+
+        let symbol_face_ids = {
+            let font_system = FONT_SYSTEM.lock();
+            font_system
+                .db()
+                .faces()
+                .filter(|face| {
+                    face.families
+                        .iter()
+                        .any(|(family, _)| family == SYMBOL_FONT_FAMILY)
+                })
+                .map(|face| face.id)
+                .collect::<Vec<_>>()
+        };
+        assert!(!symbol_face_ids.is_empty());
+        for glyph in &row[1..7] {
+            let run = glyph
+                .layout
+                .layout_runs()
+                .next()
+                .expect("symbol layout run");
+            assert_eq!(run.glyphs.len(), 1);
+            assert_ne!(run.glyphs[0].glyph_id, 0);
+            assert!(symbol_face_ids.contains(&run.glyphs[0].font_id));
+        }
+    }
+
+    #[test]
+    fn private_use_ranges_route_to_the_symbol_font() {
+        assert!(is_private_use_character('\u{e000}'));
+        assert!(is_private_use_character('\u{f8ff}'));
+        assert!(is_private_use_character('\u{f0000}'));
+        assert!(is_private_use_character('\u{ffffd}'));
+        assert!(is_private_use_character('\u{100000}'));
+        assert!(is_private_use_character('\u{10fffd}'));
+        assert!(!is_private_use_character('界'));
+        assert!(!is_private_use_character('😀'));
     }
 
     #[test]

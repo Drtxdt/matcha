@@ -454,6 +454,13 @@ fn render_cell(row: usize, column: usize, cell: &Cell, colors: &Colors) -> Rende
     if style.inverse {
         std::mem::swap(&mut foreground, &mut background);
     }
+    let mut underline_color = cell
+        .underline_color()
+        .map_or(foreground, |color| resolve_color(color, colors, true));
+    if style.dim {
+        foreground = dim_toward_background(foreground, background);
+        underline_color = dim_toward_background(underline_color, background);
+    }
     let mut text = cell.c.to_string();
     if let Some(zerowidth) = cell.zerowidth() {
         text.extend(zerowidth);
@@ -467,11 +474,22 @@ fn render_cell(row: usize, column: usize, cell: &Cell, colors: &Colors) -> Rende
         text,
         foreground,
         background,
-        underline_color: cell
-            .underline_color()
-            .map_or(foreground, |color| resolve_color(color, colors, true)),
+        underline_color,
         style,
         hyperlink: cell.hyperlink().map(|link| link.uri().to_owned()),
+    }
+}
+
+fn dim_toward_background(foreground: TerminalColor, background: TerminalColor) -> TerminalColor {
+    let blend = |foreground: u8, background: u8| {
+        u8::try_from((u16::from(foreground) * 3 + u16::from(background) * 2 + 2) / 5)
+            .expect("weighted RGB channel must fit in u8")
+    };
+    TerminalColor {
+        red: blend(foreground.red, background.red),
+        green: blend(foreground.green, background.green),
+        blue: blend(foreground.blue, background.blue),
+        alpha: foreground.alpha,
     }
 }
 
@@ -691,6 +709,80 @@ mod tests {
             .expect("styled cell should exist");
         assert!(red.style.bold);
         assert_ne!(red.foreground, TerminalColor::default());
+    }
+
+    #[test]
+    fn dims_foreground_toward_background_and_sgr_22_restores_it() {
+        let terminal = AlacrittyTerminal::new(TerminalSize::new(20, 2));
+        terminal.feed(b"N\x1b[2mD\x1b[22mR");
+        let frame = terminal.full_frame();
+        let cell = |text: &str| {
+            frame
+                .cells
+                .iter()
+                .find(|cell| cell.text == text)
+                .expect("expected rendered cell")
+        };
+        let normal = cell("N");
+        let dim = cell("D");
+        let restored = cell("R");
+        assert!(!normal.style.dim);
+        assert!(dim.style.dim);
+        assert!(!restored.style.dim);
+        assert_eq!(dim.background, normal.background);
+        assert_eq!(
+            dim.foreground,
+            dim_toward_background(normal.foreground, normal.background)
+        );
+        assert_eq!(restored.foreground, normal.foreground);
+    }
+
+    #[test]
+    fn dims_truecolor_indexed_bold_inverse_and_underline_colors() {
+        let terminal = AlacrittyTerminal::new(TerminalSize::new(20, 2));
+        terminal.feed(
+            b"\x1b[38;2;200;100;50;48;2;20;40;60;2;4;58;2;80;160;240mT\
+              \x1b[0;38;5;196;48;5;21;1;2mI\
+              \x1b[0;31;44;7;2mV",
+        );
+        let frame = terminal.full_frame();
+        let cell = |text: &str| {
+            frame
+                .cells
+                .iter()
+                .find(|cell| cell.text == text)
+                .expect("expected rendered cell")
+        };
+
+        let truecolor = cell("T");
+        let truecolor_background = TerminalColor::rgb(20, 40, 60);
+        assert_eq!(truecolor.background, truecolor_background);
+        assert_eq!(
+            truecolor.foreground,
+            dim_toward_background(TerminalColor::rgb(200, 100, 50), truecolor_background)
+        );
+        assert_eq!(
+            truecolor.underline_color,
+            dim_toward_background(TerminalColor::rgb(80, 160, 240), truecolor_background)
+        );
+
+        let indexed = cell("I");
+        assert!(indexed.style.bold && indexed.style.dim);
+        assert_eq!(
+            indexed.foreground,
+            dim_toward_background(TerminalColor::rgb(255, 0, 0), TerminalColor::rgb(0, 0, 255))
+        );
+
+        let inverse = cell("V");
+        assert!(inverse.style.inverse && inverse.style.dim);
+        assert_eq!(inverse.background, TerminalColor::rgb(230, 99, 92));
+        assert_eq!(
+            inverse.foreground,
+            dim_toward_background(
+                TerminalColor::rgb(103, 155, 222),
+                TerminalColor::rgb(230, 99, 92)
+            )
+        );
     }
 
     #[test]
